@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Node / UI
+ui/node_modules/
+src/mcp_gateway/static/ui/*
+!src/mcp_gateway/static/ui/.gitkeep
+
+# Runtime
+data/
+config.yaml
+*.db
+
+# Misc
+.DS_Store

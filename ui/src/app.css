@@ -1,0 +1,274 @@
+:root {
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --text: #1a1d21;
+  --muted: #5c6470;
+  --border: #e2e5ea;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --danger: #dc2626;
+  --ok: #16a34a;
+  --warn-bg: #fef9c3;
+  --warn-text: #713f12;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101216;
+    --card: #1a1e24;
+    --text: #e8eaed;
+    --muted: #9aa3af;
+    --border: #2c323b;
+    --accent: #818cf8;
+    --accent-hover: #a5b4fc;
+    --danger: #f87171;
+    --ok: #4ade80;
+    --warn-bg: #3b3417;
+    --warn-text: #fde68a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+#app {
+  display: flex;
+  justify-content: center;
+  padding: 3rem 1rem;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2rem;
+  width: 100%;
+  max-width: 430px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.07);
+}
+
+.card.wide {
+  max-width: 620px;
+}
+
+h1 {
+  font-size: 1.25rem;
+  margin: 0 0 0.25rem;
+}
+
+.subtitle {
+  color: var(--muted);
+  font-size: 0.875rem;
+  margin: 0 0 1.5rem;
+}
+
+label {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin: 0.9rem 0 0.3rem;
+  color: var(--muted);
+}
+
+input {
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
+input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: transparent;
+}
+
+button {
+  font: inherit;
+  border: none;
+  border-radius: 8px;
+  padding: 0.6rem 1.1rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+button.primary {
+  background: var(--accent);
+  color: #fff;
+  width: 100%;
+  margin-top: 1.3rem;
+}
+
+button.primary:hover {
+  background: var(--accent-hover);
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+button.small {
+  padding: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.error {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.85rem;
+  margin-top: 1rem;
+  word-break: break-word;
+}
+
+.notice {
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  color: var(--ok);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.85rem;
+  margin-top: 1rem;
+}
+
+.warning {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.83rem;
+  margin: 1rem 0 0;
+}
+
+.kv {
+  margin: 1.2rem 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.kv > div {
+  display: flex;
+  gap: 1rem;
+  padding: 0.55rem 0.8rem;
+  font-size: 0.85rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.kv > div:last-child {
+  border-bottom: none;
+}
+
+.kv .k {
+  color: var(--muted);
+  min-width: 7.5rem;
+  flex-shrink: 0;
+}
+
+.kv .v {
+  word-break: break-all;
+}
+
+.row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.row button {
+  flex: 1;
+}
+
+.backend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.9rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.backend:last-child {
+  border-bottom: none;
+}
+
+.backend .info {
+  min-width: 0;
+}
+
+.backend .name {
+  font-weight: 600;
+}
+
+.backend .url {
+  color: var(--muted);
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 0.12rem 0.55rem;
+  margin-left: 0.5rem;
+  vertical-align: middle;
+}
+
+.badge.ok {
+  background: color-mix(in srgb, var(--ok) 15%, transparent);
+  color: var(--ok);
+}
+
+.badge.pending {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.badge.plain {
+  background: color-mix(in srgb, var(--muted) 15%, transparent);
+  color: var(--muted);
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.spinner {
+  color: var(--muted);
+  padding: 2rem 0;
+  text-align: center;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.25rem;
+}
+
+.topbar button {
+  font-size: 0.8rem;
+}

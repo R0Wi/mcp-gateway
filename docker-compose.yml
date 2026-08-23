@@ -1,0 +1,30 @@
+# MCP Gateway behind an existing jwilder nginx-proxy + acme-companion setup.
+#
+#   1. cp config.example.yaml config.yaml   (edit it)
+#   2. export MCP_GATEWAY_ENCRYPTION_KEY=$(openssl rand -base64 32)
+#   3. docker compose up -d
+services:
+  mcp-gateway:
+    build: .
+    restart: unless-stopped
+    environment:
+      # nginx-proxy virtual hosting + Let's Encrypt companion
+      VIRTUAL_HOST: ${GATEWAY_HOST:-mcp.example.com}
+      VIRTUAL_PORT: "8000"
+      LETSENCRYPT_HOST: ${GATEWAY_HOST:-mcp.example.com}
+      # secrets referenced from config.yaml via ${...}
+      MCP_GATEWAY_ENCRYPTION_KEY: ${MCP_GATEWAY_ENCRYPTION_KEY:?set MCP_GATEWAY_ENCRYPTION_KEY}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - gateway-data:/data
+    networks:
+      - proxy
+
+volumes:
+  gateway-data:
+
+networks:
+  proxy:
+    # the network your nginx-proxy container is attached to
+    name: ${PROXY_NETWORK:-nginx-proxy}
+    external: true

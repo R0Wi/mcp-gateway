@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+*.pyc
+ui/node_modules
+src/mcp_gateway/static/ui
+data
+config.yaml
+tests
+.pytest_cache
+.ruff_cache

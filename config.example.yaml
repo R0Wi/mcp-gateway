@@ -1,0 +1,76 @@
+# MCP Gateway configuration
+#
+# Values support environment expansion: ${VAR} or ${VAR:-default}.
+
+server:
+  # Public HTTPS URL of the gateway as seen by MCP clients (behind your
+  # reverse proxy). Well-known OAuth metadata, the authorize/token endpoints
+  # and the MCP endpoint (<public_url>/mcp) are all derived from this.
+  public_url: https://mcp.example.com
+  host: 0.0.0.0
+  port: 8000
+
+auth:
+  # Key used to encrypt secrets at rest (registered clients, upstream tokens).
+  # Either a Fernet key or any long random passphrase.
+  encryption_key: ${MCP_GATEWAY_ENCRYPTION_KEY}
+
+  # Local users allowed to approve OAuth authorization requests.
+  # Generate a hash with: mcp-gateway hash-password
+  users:
+    - username: admin
+      password_hash: "$2b$12$REPLACE_ME_WITH_A_REAL_BCRYPT_HASH"
+      # For quick local testing you may use a plaintext password instead:
+      # password: change-me
+
+  # Lifetimes (seconds)
+  access_token_expiry_seconds: 3600
+  refresh_token_expiry_seconds: 2592000   # 30 days
+  login_session_expiry_seconds: 28800     # 8 hours
+
+  # Optional allow-list of redirect URI patterns for dynamically registered
+  # clients. When omitted, clients may only use the redirect URIs they
+  # registered (loopback ports are allowed to vary, which is what Claude Code
+  # CLI needs). Uncomment to restrict further:
+  # allowed_client_redirect_uris:
+  #   - "http://localhost:*/callback"
+  #   - "http://127.0.0.1:*/callback"
+  #   - "https://claude.ai/api/mcp/auth_callback"
+  #   - "https://claude.com/api/mcp/auth_callback"
+
+storage:
+  path: data/gateway.db
+
+# Upstream MCP servers. Each backend's tools are exposed with the backend
+# name as prefix, e.g. github_create_issue.
+backends:
+  # OAuth backend: the gateway runs its own OAuth client flow against the
+  # backend (CIMD if supported, DCR otherwise). Connect it once via
+  # <public_url>/ui/backends.
+  github:
+    url: https://api.githubcopilot.com/mcp/
+    auth:
+      type: oauth
+      # scopes: ["repo"]        # optional: scopes to request
+      # prefer_dcr: true        # skip CIMD even if the AS supports it
+
+  # Public backend without authentication.
+  microsoft-docs:
+    url: https://learn.microsoft.com/api/mcp
+    auth:
+      type: none
+
+  # Static bearer token (e.g. a PAT for a backend that accepts tokens directly).
+  # github-pat:
+  #   url: https://api.githubcopilot.com/mcp/
+  #   auth:
+  #     type: bearer
+  #     token: ${GITHUB_PAT}
+
+  # Arbitrary static headers (API keys etc.)
+  # internal:
+  #   url: https://internal.example.com/mcp
+  #   auth:
+  #     type: headers
+  #     headers:
+  #       X-API-Key: ${INTERNAL_API_KEY}
