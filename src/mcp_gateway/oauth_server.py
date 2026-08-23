@@ -119,10 +119,15 @@ class GatewayOAuthProvider(OAuthProvider):
                 refreshed = await self._fetch_cimd_client(client_id)
                 if refreshed is not None:
                     return refreshed
+            else:
+                logger.debug("Loaded cached client %s from storage", client_id)
             return client
 
         if self.cimd_manager.is_cimd_client_id(client_id):
+            logger.debug("Client %s not found in storage; fetching from CIMD", client_id)
             return await self._fetch_cimd_client(client_id)
+        
+        logger.debug("Client %s is not a CIMD client, return None", client_id)
         return None
 
     async def _fetch_cimd_client(self, client_id: str) -> GatewayClient | None:
