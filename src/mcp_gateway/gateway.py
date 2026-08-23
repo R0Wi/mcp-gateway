@@ -42,6 +42,7 @@ def build_gateway(
     @mcp.tool(name="gateway_status")
     def gateway_status() -> list[dict]:
         """List the backends configured in this gateway and their connection state."""
+        logger.debug("gateway_status tool invoked")
         return manager.backend_status()
 
     for name, backend in config.backends.items():

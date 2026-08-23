@@ -22,6 +22,7 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
     if isinstance(config, str):
         config = load_config(config)
 
+    logger.debug("Opening storage at %s", config.storage.path)
     storage = Storage(config.storage.path, config.auth.encryption_key)
     provider = GatewayOAuthProvider(config, storage)
     manager = BackendManager(config, storage)
@@ -31,6 +32,7 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
         for name, backend in config.backends.items()
         if backend.enabled
     }
+    logger.debug("Built %d backend client(s)", len(clients))
 
     mcp = build_gateway(config, provider, manager, clients)
     # The MCP endpoint lives at <public_url>/mcp; auth + well-known routes sit
@@ -39,9 +41,12 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        logger.info("Starting up: purging expired tokens/codes/transactions")
         storage.purge_expired()
+        logger.info("MCP Gateway ready at %s", config.server.public_url)
         async with mcp_app.lifespan(mcp_app):
             yield
+        logger.info("Shutting down: closing storage")
         storage.close()
 
     app = FastAPI(title="MCP Gateway", lifespan=lifespan, docs_url=None, redoc_url=None)

@@ -151,6 +151,37 @@ falls back to Dynamic Client Registration. If the upstream AS supports neither (
 GitHub's), set `client_id` (and `client_secret`, if the app is confidential) to use a
 pre-registered OAuth client instead — CIMD/DCR are skipped entirely.
 
+## Logging
+
+The gateway logs to stdout/stderr (`docker logs`, `docker compose logs -f`), at `INFO` by
+default: startup/shutdown, config summary, login attempts, OAuth authorize/consent/token
+issuance, upstream backend connect/disconnect, and backend mount status. `DEBUG` adds
+finer-grained detail (client construction, token rotation, CIMD refreshes, storage
+housekeeping). No credentials or tokens are ever logged, at any level.
+
+Set the level via the `MCP_GATEWAY_LOG_LEVEL` environment variable (`debug`, `info`,
+`warning`, `error`, or `critical`):
+
+```bash
+# .env (picked up by docker compose)
+MCP_GATEWAY_LOG_LEVEL=debug
+```
+
+```bash
+# or inline
+docker compose run --rm -e MCP_GATEWAY_LOG_LEVEL=debug mcp-gateway
+```
+
+`docker-compose.yml` already forwards this variable to the container, defaulting to
+`info` when unset.
+
+Outside Docker, `--log-level` on `mcp-gateway run` works the same way and takes
+precedence over the env var:
+
+```bash
+mcp-gateway run -c config.yaml --log-level debug
+```
+
 ## Endpoints
 
 | Path                                          | Purpose                                        |

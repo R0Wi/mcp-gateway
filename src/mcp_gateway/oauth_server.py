@@ -20,6 +20,7 @@ JSON API in ``web.py`` and finally calls :meth:`GatewayOAuthProvider.complete_au
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from typing import Any
@@ -51,6 +52,8 @@ from starlette.routing import Route
 
 from mcp_gateway.config import GatewayConfig
 from mcp_gateway.storage import Storage
+
+logger = logging.getLogger(__name__)
 
 CIMD_REFRESH_SECONDS = 3600
 
@@ -112,6 +115,7 @@ class GatewayOAuthProvider(OAuthProvider):
                 client.cimd_fetched_at is None
                 or time.time() - client.cimd_fetched_at > CIMD_REFRESH_SECONDS
             ):
+                logger.debug("Refreshing stale CIMD client document for %s", client_id)
                 refreshed = await self._fetch_cimd_client(client_id)
                 if refreshed is not None:
                     return refreshed
@@ -133,6 +137,11 @@ class GatewayOAuthProvider(OAuthProvider):
         client = GatewayClient.model_validate(client_info.model_dump(mode="json"))
         client.allowed_redirect_uri_patterns = self._allowed_redirect_patterns
         self.storage.save_client(client.client_id, client.model_dump(mode="json"))
+        logger.info(
+            "Registered new OAuth client %r via DCR (%s)",
+            client_info.client_name or client_info.client_id,
+            client.client_id,
+        )
 
     # ------------------------------------------------------------------ authorize
 
@@ -191,10 +200,14 @@ class GatewayOAuthProvider(OAuthProvider):
         self.storage.delete_txn(txn_id)
 
         if not approve:
+            logger.info(
+                "Authorization denied by %s for client %s", subject, txn["client_id"]
+            )
             return construct_redirect_uri(
                 txn["redirect_uri"], error="access_denied", state=txn.get("state")
             )
 
+        logger.info("Authorization approved by %s for client %s", subject, txn["client_id"])
         code = secrets.token_urlsafe(32)
         expires_at = time.time() + self.config.auth.authorization_code_expiry_seconds
         self.storage.save_auth_code(
@@ -276,6 +289,11 @@ class GatewayOAuthProvider(OAuthProvider):
         if self.storage.get_auth_code(authorization_code.code) is None:
             raise TokenError(error="invalid_grant", error_description="Authorization code expired")
         self.storage.delete_auth_code(authorization_code.code)
+        logger.info(
+            "Issuing access/refresh token pair to client %s (subject=%s)",
+            client.client_id,
+            authorization_code.subject,
+        )
         return self._issue_tokens(
             client_id=client.client_id,
             scopes=authorization_code.scopes,
@@ -310,6 +328,7 @@ class GatewayOAuthProvider(OAuthProvider):
         # token is revoked and a fresh access/refresh pair is issued.
         self.storage.revoke_refresh_token(refresh_token.token)
         effective_scopes = scopes or data["scopes"]
+        logger.debug("Rotating refresh token for client %s", client.client_id)
         return self._issue_tokens(
             client_id=client.client_id,
             scopes=effective_scopes,
@@ -332,6 +351,7 @@ class GatewayOAuthProvider(OAuthProvider):
         )
 
     async def revoke_token(self, token: FastMCPAccessToken | RefreshToken) -> None:
+        logger.info("Revoking token for client %s", token.client_id)
         self.storage.delete_access_token(token.token)
         self.storage.revoke_refresh_token(token.token)
 

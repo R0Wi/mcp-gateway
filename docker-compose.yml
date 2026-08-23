@@ -13,6 +13,8 @@ services:
       # needed if config.yaml has an upstream using GitHub OAuth
       # GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:?set GITHUB_OAUTH_CLIENT_ID}
       # GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:?set GITHUB_OAUTH_CLIENT_SECRET}
+      # log verbosity: debug, info, warning, error, critical (default: info)
+      MCP_GATEWAY_LOG_LEVEL: ${MCP_GATEWAY_LOG_LEVEL:-info}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - gateway-data:/data

@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import secrets
 import sqlite3
 import threading
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -348,8 +351,13 @@ class Storage:
     def purge_expired(self) -> None:
         now = time.time()
         with self._lock:
-            self._conn.execute("DELETE FROM auth_codes WHERE expires_at < ?", (now,))
-            self._conn.execute("DELETE FROM access_tokens WHERE expires_at < ?", (now,))
-            self._conn.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (now,))
-            self._conn.execute("DELETE FROM auth_txns WHERE expires_at < ?", (now,))
+            cur = self._conn.execute("DELETE FROM auth_codes WHERE expires_at < ?", (now,))
+            deleted = cur.rowcount
+            cur = self._conn.execute("DELETE FROM access_tokens WHERE expires_at < ?", (now,))
+            deleted += cur.rowcount
+            cur = self._conn.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (now,))
+            deleted += cur.rowcount
+            cur = self._conn.execute("DELETE FROM auth_txns WHERE expires_at < ?", (now,))
+            deleted += cur.rowcount
             self._conn.commit()
+        logger.debug("Purged %d expired row(s) from storage", deleted)

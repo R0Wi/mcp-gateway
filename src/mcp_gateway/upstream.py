@@ -151,6 +151,12 @@ class BackendManager:
             headers.update({k.lower(): v for k, v in backend.auth.headers.items()})
         elif backend.auth.type == "oauth":
             auth = self._build_oauth_provider(name, backend)
+        logger.debug(
+            "Built client for backend %s (auth=%s, %d static header(s))",
+            name,
+            backend.auth.type,
+            len(headers),
+        )
         transport = StreamableHttpTransport(backend.url, headers=headers or None, auth=auth)
         return Client(transport)
 
@@ -209,6 +215,11 @@ class BackendManager:
             client_metadata_url=client_metadata_url,
         )
         self._oauth_providers[name] = provider
+        logger.debug(
+            "Built OAuth provider for backend %s (registration=%s)",
+            name,
+            "static" if static_client_info else ("cimd" if client_metadata_url else "dcr"),
+        )
         return provider
 
     def client_metadata_document(self) -> dict[str, Any]:
@@ -240,6 +251,7 @@ class BackendManager:
             flow.state = state
             if state is not None:
                 self._flows_by_state[state] = flow
+            logger.info("Backend %s: redirecting to upstream authorization server", backend)
             flow.authorize_url.set_result(authorization_url)
 
         return redirect_handler
@@ -260,6 +272,7 @@ class BackendManager:
         task: the 401 challenge triggers discovery, CIMD/DCR and the redirect
         handler, which hands the authorization URL back to this coroutine.
         """
+        logger.info("Backend %s: starting interactive OAuth connect flow", name)
         backend = self.config.backends.get(name)
         if backend is None or backend.auth.type != "oauth":
             raise ValueError(f"Backend '{name}' is not an OAuth backend")
@@ -275,6 +288,7 @@ class BackendManager:
                 # actually unwind before starting a new attempt, or the new
                 # attempt would silently queue behind that lock and time out
                 # without ever sending a request.
+                logger.debug("Backend %s: cancelling stale connect flow task", name)
                 old_flow.task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await old_flow.task
@@ -288,8 +302,10 @@ class BackendManager:
                 # otherwise be retried forever without user interaction.
                 async with client:
                     await client.ping()
+                logger.info("Backend %s: OAuth connect flow succeeded", name)
                 flow.done.set_result(None)
             except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+                logger.warning("Backend %s: OAuth connect flow failed: %s", name, exc)
                 if not flow.done.done():
                     flow.done.set_result(f"{type(exc).__name__}: {exc}")
                 if not flow.authorize_url.done():
@@ -317,7 +333,9 @@ class BackendManager:
             # the mapping is unambiguous.
             flow = next(iter(self._flows_by_backend.values()))
         if flow is None or flow.callback.done():
+            logger.warning("Received upstream OAuth callback with no matching connect flow")
             return None
+        logger.debug("Backend %s: delivering upstream OAuth callback", flow.backend)
         flow.callback.set_result((code, state))
         return flow.backend
 
@@ -340,6 +358,7 @@ class BackendManager:
 
     def disconnect(self, name: str) -> None:
         """Drop stored upstream credentials for a backend."""
+        logger.info("Backend %s: disconnecting (dropping stored upstream credentials)", name)
         self.storage.delete_upstream(name)
         provider = self._oauth_providers.get(name)
         if provider is not None:

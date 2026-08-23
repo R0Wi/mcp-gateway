@@ -20,7 +20,15 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("MCP_GATEWAY_CONFIG", "config.yaml"),
         help="Path to the YAML config file (default: config.yaml or $MCP_GATEWAY_CONFIG)",
     )
-    run.add_argument("--log-level", default="info")
+    run.add_argument(
+        "--log-level",
+        default=os.environ.get("MCP_GATEWAY_LOG_LEVEL", "info"),
+        help=(
+            "Log verbosity: debug, info, warning, error, critical "
+            "(default: info or $MCP_GATEWAY_LOG_LEVEL). Also governs FastMCP's "
+            "own internal logging."
+        ),
+    )
 
     sub.add_parser("hash-password", help="Generate a bcrypt hash for the users section")
 
@@ -32,6 +40,24 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    if args.command == "run":
+        # The mcp_gateway package already configured logging (and synced
+        # $FASTMCP_LOG_LEVEL) from $MCP_GATEWAY_LOG_LEVEL at import time —
+        # merely importing this module (via the `mcp-gateway` entry point)
+        # triggers that, before argparse has even run. Force-reapply it here
+        # so an explicit --log-level flag (which may differ from the env var)
+        # actually takes effect; FASTMCP_LOG_LEVEL still needs a plain
+        # assignment since fastmcp itself isn't imported until create_app()
+        # runs below, so this value is what it will pick up.
+        level = args.log_level.upper()
+        os.environ["MCP_GATEWAY_LOG_LEVEL"] = level
+        os.environ["FASTMCP_LOG_LEVEL"] = level
+        logging.basicConfig(
+            level=getattr(logging, level, logging.INFO),
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            force=True,
+        )
 
     if args.command == "hash-password":
         import bcrypt
@@ -56,11 +82,15 @@ def main(argv: list[str] | None = None) -> int:
 
         from mcp_gateway.app import create_app
 
-        logging.basicConfig(
-            level=getattr(logging, args.log_level.upper(), logging.INFO),
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        )
+        logger = logging.getLogger("mcp_gateway")
+        logger.debug("Loading config from %s", args.config)
         config = load_config(args.config)
+        logger.info(
+            "Config loaded: %d user(s), %d backend(s) (%s)",
+            len(config.auth.users),
+            len(config.backends),
+            ", ".join(sorted(config.backends)) or "none",
+        )
         app = create_app(config)
         uvicorn.run(
             app,

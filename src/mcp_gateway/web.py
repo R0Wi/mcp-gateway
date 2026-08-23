@@ -66,7 +66,9 @@ def build_auth_router() -> APIRouter:
         # Small fixed delay to blunt online guessing on this single-user AS.
         await asyncio.sleep(0.3)
         if not verify_user(config.auth, body.username, body.password):
+            logger.warning("Failed login attempt for username %r", body.username)
             raise HTTPException(status_code=401, detail="Invalid username or password")
+        logger.info("User %r logged in", body.username)
         sessions: SessionManager = request.app.state.sessions
         response.set_cookie(
             SESSION_COOKIE,
@@ -103,10 +105,11 @@ def build_auth_router() -> APIRouter:
 
     @router.post("/backends/{name}/disconnect")
     async def disconnect(name: str, request: Request):
-        _require_session(request)
+        user = _require_session(request)
         manager = request.app.state.backend_manager
         if name not in request.app.state.config.backends:
             raise HTTPException(status_code=404, detail="Unknown backend")
+        logger.info("User %r requested disconnect of backend %r", user, name)
         manager.disconnect(name)
         return {"ok": True}
 
@@ -127,12 +130,14 @@ def build_oauth_router() -> APIRouter:
 
     @router.get("/oauth/connect/{name}")
     async def connect(name: str, request: Request):
-        if _session_user(request) is None:
+        user = _session_user(request)
+        if user is None:
             return RedirectResponse(f"/ui/backends?login_next=connect:{name}")
         manager = request.app.state.backend_manager
         clients = request.app.state.backend_clients
         if name not in clients:
             raise HTTPException(status_code=404, detail="Unknown or disabled backend")
+        logger.info("User %r requested connect of backend %r", user, name)
         try:
             authorize_url = await manager.start_connect(name, clients[name])
         except Exception as exc:
@@ -183,6 +188,7 @@ def build_ui_router() -> APIRouter:
             return FileResponse(candidate)
         index = STATIC_DIR / "index.html"
         if not index.exists():
+            logger.error("UI assets not built; serving 503 for /ui/%s", rest)
             return JSONResponse(
                 {
                     "error": "UI assets not built",
