@@ -12,8 +12,8 @@ Claude Code / Claude.ai ──OAuth 2.1 (DCR/CIMD + PKCE)──▶ MCP Gateway �
 ```
 
 Built with **FastAPI + FastMCP**, configured by a **single YAML file**, stores its state
-in a single encrypted SQLite database, and ships as one small container designed to run
-behind an existing jwilder `nginx-proxy` + Let's Encrypt companion.
+in a single encrypted SQLite database, and ships as one small standalone container —
+no reverse proxy required, though you can put one in front of it for TLS.
 
 ## Features
 
@@ -60,14 +60,14 @@ behind an existing jwilder `nginx-proxy` + Let's Encrypt companion.
 ```bash
 cp config.example.yaml config.yaml
 $EDITOR config.yaml                                   # set public_url, users, backends
-export MCP_GATEWAY_ENCRYPTION_KEY=$(openssl rand -base64 32)
-export GATEWAY_HOST=mcp.example.com                   # your VIRTUAL_HOST
+cp .env.example .env
+$EDITOR .env                                           # set MCP_GATEWAY_ENCRYPTION_KEY (openssl rand -base64 32)
 docker compose up -d
 ```
 
-The compose file attaches to your existing `nginx-proxy` network and sets
-`VIRTUAL_HOST`/`VIRTUAL_PORT`/`LETSENCRYPT_HOST`; there is no bundled reverse proxy or
-TLS termination.
+The gateway runs standalone and listens on `:8000`; `docker compose` picks up
+`MCP_GATEWAY_ENCRYPTION_KEY` from `.env` automatically. Put it behind a reverse proxy of
+your choice for TLS, or expose the port directly.
 
 Generate a password hash for the config file:
 
@@ -119,7 +119,12 @@ storage:
 backends:
   github:                                # → tools namespaced github_*
     url: https://api.githubcopilot.com/mcp/
-    auth: { type: oauth }
+    auth:
+      type: oauth
+      # GitHub's authorization server supports neither CIMD nor DCR, so
+      # register a GitHub OAuth App and provide its credentials directly:
+      client_id: ${GITHUB_OAUTH_CLIENT_ID}
+      client_secret: ${GITHUB_OAUTH_CLIENT_SECRET}
   microsoft-docs:                        # → tools namespaced microsoft-docs_*
     url: https://learn.microsoft.com/api/mcp
     auth: { type: none }
@@ -137,12 +142,14 @@ Adding a backend is config-only — no code changes.
 | `none`    | –                               | no credentials sent                                                   |
 | `bearer`  | `token`                         | `Authorization: Bearer <token>` on every request                      |
 | `headers` | `headers: {Name: value}`        | static headers (API keys etc.)                                        |
-| `oauth`   | `scopes`, `prefer_dcr`          | full OAuth client: CIMD → DCR fallback, PKCE, refresh, encrypted store |
+| `oauth`   | `scopes`, `prefer_dcr`, `client_id`, `client_secret` | full OAuth client: CIMD → DCR fallback, PKCE, refresh, encrypted store |
 
 For `oauth` backends the gateway hosts its own Client ID Metadata Document at
 `<public_url>/oauth/client-metadata.json` and uses it as its client ID whenever the
 upstream AS advertises CIMD support (requires an HTTPS `public_url`); otherwise it
-falls back to Dynamic Client Registration.
+falls back to Dynamic Client Registration. If the upstream AS supports neither (e.g.
+GitHub's), set `client_id` (and `client_secret`, if the app is confidential) to use a
+pre-registered OAuth client instead — CIMD/DCR are skipped entirely.
 
 ## Endpoints
 
@@ -200,5 +207,5 @@ OAuth-protected upstream) and drives complete DCR/CIMD + PKCE flows over HTTP.
   routes + well-known) is mounted at the root.
 - `ui/` — Svelte 5 + Vite SPA (login, consent, backends).
 
-Single-instance by design (SQLite + in-memory connect flows). Put it behind your
-existing reverse proxy and back up one file.
+Single-instance by design (SQLite + in-memory connect flows). Runs standalone; put it
+behind a reverse proxy of your own if you want TLS termination, and back up one file.

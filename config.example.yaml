@@ -39,7 +39,7 @@ auth:
   #   - "https://claude.com/api/mcp/auth_callback"
 
 storage:
-  path: data/gateway.db
+  path: /data/gateway.db
 
 # Upstream MCP servers. Each backend's tools are exposed with the backend
 # name as prefix, e.g. github_create_issue.
@@ -53,6 +53,13 @@ backends:
       type: oauth
       # scopes: ["repo"]        # optional: scopes to request
       # prefer_dcr: true        # skip CIMD even if the AS supports it
+      # GitHub's authorization server supports neither CIMD nor Dynamic
+      # Client Registration, so automatic discovery fails with a 404 on
+      # "Connect". Register a GitHub OAuth App instead
+      # (https://github.com/settings/developers), set its callback URL to
+      # <public_url>/oauth/callback, and provide its credentials here:
+      client_id: ${GITHUB_OAUTH_CLIENT_ID}
+      client_secret: ${GITHUB_OAUTH_CLIENT_SECRET}
 
   # Public backend without authentication.
   microsoft-docs:

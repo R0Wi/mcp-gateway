@@ -103,6 +103,12 @@ class BackendAuthConfig(BaseModel):
     scopes: list[str] | None = None
     # type == "oauth": force DCR even if the upstream AS supports CIMD.
     prefer_dcr: bool = False
+    # type == "oauth": pre-registered client credentials. Required for upstream
+    # authorization servers that support neither CIMD nor Dynamic Client
+    # Registration (e.g. GitHub's, which requires a manually created OAuth App).
+    # When set, these are used directly and no CIMD/DCR is attempted.
+    client_id: str | None = None
+    client_secret: str | None = None
 
     @model_validator(mode="after")
     def _check(self) -> BackendAuthConfig:
@@ -110,6 +116,8 @@ class BackendAuthConfig(BaseModel):
             raise ValueError("backend auth type 'bearer' requires 'token'")
         if self.type == "headers" and not self.headers:
             raise ValueError("backend auth type 'headers' requires 'headers'")
+        if self.type != "oauth" and self.client_secret:
+            raise ValueError("client_secret is only valid for auth type 'oauth'")
         return self
 
 
