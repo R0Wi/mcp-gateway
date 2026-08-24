@@ -126,7 +126,31 @@ class Storage:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._lock = threading.RLock()
+        self._migrate_schema()
         self._init_encryption(encryption_key)
+
+    def _migrate_schema(self) -> None:
+        """Add columns introduced after a table already existed.
+
+        `CREATE TABLE IF NOT EXISTS` in `_SCHEMA` is a no-op on a database
+        from an older version, so it never retroactively adds new columns to
+        an existing table -- they have to be `ALTER TABLE`'d in explicitly.
+        """
+        self._ensure_columns(
+            "oauth_clients",
+            {
+                "is_cimd": "is_cimd INTEGER NOT NULL DEFAULT 0",
+                "last_used_at": "last_used_at REAL",
+            },
+        )
+
+    def _ensure_columns(self, table: str, columns: dict[str, str]) -> None:
+        with self._lock:
+            existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            for name, column_ddl in columns.items():
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_ddl}")
+            self._conn.commit()
 
     def _kek_fernet(self, key: str) -> Fernet:
         """Build the Key Encryption Key Fernet instance for an operator-supplied key.
