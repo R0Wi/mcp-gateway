@@ -139,6 +139,39 @@ async def test_login_does_not_stall_unrelated_requests(run_server):
     )
 
 
+async def test_healthz_flood_stays_responsive(run_server):
+    """A flood of concurrent /healthz requests must be served concurrently,
+    not serialized -- each request should complete close to baseline latency
+    instead of queuing up behind the ones ahead of it (the failure mode
+    H-1 describes: a burst of cheap/unauthenticated requests stalling the
+    whole gateway, including health checks, for everyone)."""
+    import asyncio
+
+    port = free_port()
+    config = gateway_config(port)
+    server = run_server(create_app(config), port)
+    base = server.base_url
+
+    async with httpx.AsyncClient(timeout=60) as http:
+        t0 = time.perf_counter()
+        await http.get(f"{base}/healthz")
+        baseline = time.perf_counter() - t0
+
+        n = 200
+        t0 = time.perf_counter()
+        responses = await asyncio.gather(*(http.get(f"{base}/healthz") for _ in range(n)))
+        elapsed = time.perf_counter() - t0
+
+    assert all(r.status_code == 200 for r in responses)
+    # If requests were serialized (blocking the event loop one at a time),
+    # this would scale linearly with n * baseline. Concurrent handling
+    # should keep total wall-clock to a small multiple of baseline instead.
+    assert elapsed < max(baseline * 20, 1.0), (
+        f"a flood of /healthz requests was not served concurrently: "
+        f"baseline={baseline*1000:.0f}ms n={n} elapsed={elapsed*1000:.0f}ms"
+    )
+
+
 async def test_login_rate_limited_per_ip(gateway):
     server, app = gateway
     base = server.base_url
