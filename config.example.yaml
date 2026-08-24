@@ -9,11 +9,24 @@ server:
   public_url: https://mcp.example.com
   host: 0.0.0.0
   port: 8000
+  # Peer(s) allowed to set X-Forwarded-For / X-Forwarded-Proto. Defaults to
+  # loopback only. If you run a reverse proxy in front (for TLS), set this
+  # to its address (e.g. your Docker network's bridge/proxy container IP or
+  # CIDR) so client IPs and https detection are correct; otherwise leave the
+  # default so a client can't spoof its own address.
+  # trusted_proxy_ips: 127.0.0.1
 
 auth:
   # Key used to encrypt secrets at rest (registered clients, upstream tokens).
-  # Either a Fernet key or any long random passphrase.
-  encryption_key: ${MCP_GATEWAY_ENCRYPTION_KEY}
+  # Either a Fernet key or any long random passphrase. Supplied via the
+  # MCP_GATEWAY_ENCRYPTION_KEY env var by default; set MCP_GATEWAY_ENCRYPTION_KEY_FILE
+  # instead to read it from a file (e.g. a Docker Compose secret) -- it takes
+  # precedence when set, and this line doesn't need to change either way (the
+  # ":-" default below just means "don't error here if only the _FILE
+  # variant is used" -- the gateway still refuses to start with no key at all).
+  # See the README's "Encryption key" section for supplying, rotating, and
+  # backing up this key.
+  encryption_key: ${MCP_GATEWAY_ENCRYPTION_KEY:-}
 
   # Local users allowed to approve OAuth authorization requests.
   # Generate a hash with: mcp-gateway hash-password

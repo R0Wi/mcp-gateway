@@ -294,6 +294,9 @@ class GatewayOAuthProvider(OAuthProvider):
         if self.storage.get_auth_code(authorization_code.code) is None:
             raise TokenError(error="invalid_grant", error_description="Authorization code expired")
         self.storage.delete_auth_code(authorization_code.code)
+        # A completed authorization exempts this client from the unused-client
+        # TTL that reclaims anonymous DCR/CIMD registrations (see storage.py).
+        self.storage.mark_client_used(client.client_id)
         logger.info(
             "Issuing access/refresh token pair to client %s (subject=%s)",
             client.client_id,

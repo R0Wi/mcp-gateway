@@ -67,7 +67,8 @@ docker compose up -d
 
 The gateway runs standalone and listens on `:8000`; `docker compose` picks up
 `MCP_GATEWAY_ENCRYPTION_KEY` from `.env` automatically. Put it behind a reverse proxy of
-your choice for TLS, or expose the port directly.
+your choice for TLS, or expose the port directly. For a file-based alternative to
+`.env` (recommended for production), see [Encryption key](#encryption-key).
 
 Generate a password hash for the config file:
 
@@ -151,6 +152,51 @@ falls back to Dynamic Client Registration. If the upstream AS supports neither (
 GitHub's), set `client_id` (and `client_secret`, if the app is confidential) to use a
 pre-registered OAuth client instead — CIMD/DCR are skipped entirely.
 
+### Encryption key
+
+`auth.encryption_key` protects everything the gateway stores at rest: registered
+OAuth client records and upstream backends' access/refresh tokens (see
+[Security](#security) for how). Two ways to supply it:
+
+- **`MCP_GATEWAY_ENCRYPTION_KEY`** (default) — a plain environment variable,
+  referenced from `config.yaml` as `${MCP_GATEWAY_ENCRYPTION_KEY}`. Simple, and fine
+  for a self-hosted single-admin deployment.
+- **`MCP_GATEWAY_ENCRYPTION_KEY_FILE`** — path to a file containing the key,
+  e.g. `/run/secrets/encryption_key`. Takes precedence over
+  `MCP_GATEWAY_ENCRYPTION_KEY` when set, and `config.yaml` doesn't need any change
+  either way. This is the [Docker Compose `secrets:`
+  convention](https://docs.docker.com/compose/how-tos/use-secrets/) — it keeps the
+  raw key out of `docker inspect` and `docker compose config` output, and is what
+  Kubernetes `Secret` volumes, Vault Agent, and most KMS sidecars all expect too.
+  `docker-compose.yml` has a commented-out example; switching is a few uncommented
+  lines, no rebuild required.
+
+Internally, the key you supply is a **Key Encryption Key (KEK)**: it never encrypts
+data directly. On first run the gateway generates a random Data Encryption Key (DEK)
+that does the actual encrypting, and stores the DEK wrapped by the KEK. This means
+rotating `encryption_key` only has to re-wrap that one small DEK, not re-encrypt the
+whole database:
+
+```bash
+openssl rand -base64 32 > new-key.txt
+mcp-gateway rotate-key -c config.yaml --old-key-file old-key.txt --new-key-file new-key.txt
+```
+
+This updates the database in place (an O(1) operation, regardless of how much data
+it holds); update `MCP_GATEWAY_ENCRYPTION_KEY`/`MCP_GATEWAY_ENCRYPTION_KEY_FILE` to
+`new-key.txt`'s contents and restart the gateway afterwards. If `--old-key-file`
+doesn't match the key currently protecting the database, the command fails with an
+error and changes nothing.
+
+#### If you lose the key
+
+There is no recovery path — that's what "encrypted" means. Every registered OAuth
+client would need to re-register (most do this automatically via DCR/CIMD on next
+use) and every OAuth backend would need reconnecting via `/ui/backends`. Back the key
+up the way you'd back up any other irreplaceable credential — a password manager, a
+sealed secret in your org's vault — not just as a file that only exists on the host
+running the gateway.
+
 ## Logging
 
 The gateway logs to stdout/stderr (`docker logs`, `docker compose logs -f`), at `INFO` by
@@ -196,26 +242,60 @@ mcp-gateway run -c config.yaml --log-level debug
 | `/oauth/connect/<backend>`, `/oauth/callback` | upstream OAuth connect flow                    |
 | `/healthz`                                    | liveness                                       |
 
-## Security notes
+## Security
+
+A quick tour of the primitives in use and what they're for, before the detailed list
+below:
+
+- **Secrets at rest** (registered OAuth client records, upstream backends'
+  access/refresh tokens) are encrypted with **Fernet** — AES-128-CBC plus
+  HMAC-SHA256, authenticated symmetric encryption from Python's well-audited
+  `cryptography` package, not hand-rolled crypto. See [Encryption
+  key](#encryption-key) for how the key itself is supplied, wrapped (envelope
+  encryption), and rotated.
+- **Passwords**: local users' passwords are hashed with **bcrypt**
+  (`mcp-gateway hash-password`); a passphrase-style `encryption_key` is stretched
+  into a Fernet key with **scrypt** (`n=2**17`, current OWASP guidance) plus a random
+  per-database salt, rather than used directly.
+- **Tokens**: access/refresh tokens and authorization codes are never stored in
+  recoverable form — only a **SHA-256 hash** of each, the same way a password would be.
+- **Sessions**: browser login sessions are signed cookies (**itsdangerous**), not
+  server-side session IDs, but are still revocable — logout records the session in
+  SQLite so it stops validating immediately, not just when the cookie expires.
+
+None of this protects a fully compromised gateway process — a key that's *decrypting
+and using* secrets on every request necessarily has to be in that process's memory.
+What it protects against is the database file leaking *without* the process: a
+misdirected backup, a shared volume snapshot, a support bundle.
+
+### Hardening measures
 
 - PKCE (S256) is mandatory; authorization codes are single-use and expire in 5 min.
 - Refresh tokens rotate on every use (OAuth 2.1 public-client requirement).
-- Access/refresh tokens and auth codes are stored as SHA-256 hashes only.
-- Registered client records and upstream credentials are Fernet-encrypted at rest
-  (`auth.encryption_key`; passphrases are stretched with scrypt + per-DB salt).
 - The consent screen names the client and the exact redirect target, and warns on
   loopback redirects (CIMD localhost-impersonation guidance from the spec).
 - Tokens issued to MCP clients are never forwarded to backends, and backend
   credentials never reach MCP clients.
-- Sessions are signed (`itsdangerous`), `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS.
-- No credentials are logged.
+- Sessions are `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS.
+- Login and Dynamic Client Registration (`/register`) are rate-limited per source IP;
+  password checks run off the event loop so a flood of attempts can't stall the server.
+- Anonymous DCR/CIMD client registrations that never complete an authorization are
+  reclaimed after 24h; storage doesn't grow unbounded from unauthenticated `/register` traffic.
+- Security headers (CSP, `X-Frame-Options: DENY`, `Referrer-Policy`, `X-Content-Type-Options`)
+  are set on every response.
+- `X-Forwarded-*` headers are trusted only from `server.trusted_proxy_ips` (default:
+  loopback). Set this to your reverse proxy's address if you run one — see
+  [Configuration](#configuration).
+- No credentials are logged. A decrypt failure caused by a mismatched
+  `encryption_key` is logged loudly at startup rather than silently treated as
+  missing data — see [Encryption key](#encryption-key).
 
 ## Development
 
 ```bash
 uv venv && uv pip install -e ".[dev]"     # or: pip install -e ".[dev]"
 (cd ui && npm install && npm run build)   # build the Svelte UI
-pytest                                    # 35 tests incl. full e2e OAuth flows
+pytest                                    # 61 tests incl. full e2e OAuth flows
 mcp-gateway run -c config.yaml
 ```
 

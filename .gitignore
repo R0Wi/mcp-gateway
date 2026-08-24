@@ -17,6 +17,7 @@ src/mcp_gateway/static/ui/*
 data/
 config.yaml
 *.db
+secrets/
 
 # Misc
 .DS_Store

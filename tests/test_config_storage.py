@@ -137,10 +137,38 @@ def test_verify_user_bcrypt():
 
 
 def test_session_roundtrip_and_tamper():
-    sessions = SessionManager("secret", max_age_seconds=60)
+    storage = Storage(":memory:", "test-passphrase")
+    sessions = SessionManager("secret", max_age_seconds=60, storage=storage)
     cookie = sessions.create("admin")
     assert sessions.validate(cookie) == "admin"
     assert sessions.validate(cookie + "x") is None
     assert sessions.validate(None) is None
-    other = SessionManager("different-secret", max_age_seconds=60)
+    other = SessionManager("different-secret", max_age_seconds=60, storage=storage)
     assert other.validate(cookie) is None
+
+
+def test_session_revoked_on_logout():
+    storage = Storage(":memory:", "test-passphrase")
+    sessions = SessionManager("secret", max_age_seconds=60, storage=storage)
+    cookie = sessions.create("admin")
+    assert sessions.validate(cookie) == "admin"
+
+    sessions.revoke(cookie)
+    assert sessions.validate(cookie) is None, "revoked session must stop validating immediately"
+
+    # Revoking twice, or an unknown/garbage cookie, must not raise.
+    sessions.revoke(cookie)
+    sessions.revoke("not-a-real-cookie")
+    sessions.revoke(None)
+
+
+def test_session_revocation_is_per_session_not_per_user():
+    storage = Storage(":memory:", "test-passphrase")
+    sessions = SessionManager("secret", max_age_seconds=60, storage=storage)
+    cookie_a = sessions.create("admin")
+    cookie_b = sessions.create("admin")
+    assert cookie_a != cookie_b, "each login should mint a distinct session"
+
+    sessions.revoke(cookie_a)
+    assert sessions.validate(cookie_a) is None
+    assert sessions.validate(cookie_b) == "admin", "revoking one session must not affect another"
