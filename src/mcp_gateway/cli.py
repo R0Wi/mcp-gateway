@@ -7,6 +7,7 @@ import getpass
 import logging
 import os
 import sys
+from pathlib import Path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,6 +38,28 @@ def main(argv: list[str] | None = None) -> int:
         "-c",
         "--config",
         default=os.environ.get("MCP_GATEWAY_CONFIG", "config.yaml"),
+    )
+
+    rotate = sub.add_parser(
+        "rotate-key",
+        help="Rotate auth.encryption_key without re-encrypting the whole database",
+    )
+    rotate.add_argument(
+        "-c",
+        "--config",
+        default=os.environ.get("MCP_GATEWAY_CONFIG", "config.yaml"),
+        help="Path to the YAML config file, used to find storage.path (default: "
+        "config.yaml or $MCP_GATEWAY_CONFIG)",
+    )
+    rotate.add_argument(
+        "--old-key-file",
+        required=True,
+        help="File containing the key currently protecting the database",
+    )
+    rotate.add_argument(
+        "--new-key-file",
+        required=True,
+        help="File containing the new key to protect the database with",
     )
 
     args = parser.parse_args(argv)
@@ -77,10 +100,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"OK: {len(config.auth.users)} user(s), {len(config.backends)} backend(s)")
         return 0
 
+    if args.command == "rotate-key":
+        from mcp_gateway.config import load_storage_path
+        from mcp_gateway.storage import EncryptionKeyError, Storage
+
+        storage_path = load_storage_path(args.config)
+        old_key = Path(args.old_key_file).read_text().strip()
+        new_key = Path(args.new_key_file).read_text().strip()
+        try:
+            Storage.rotate_key(storage_path, old_key, new_key)
+        except EncryptionKeyError:
+            print(
+                f"Error: --old-key-file does not match the key currently protecting {storage_path}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Encryption key rotated for {storage_path}")
+        return 0
+
     if args.command == "run":
         import uvicorn
 
         from mcp_gateway.app import create_app
+        from mcp_gateway.storage import EncryptionKeyError
 
         logger = logging.getLogger("mcp_gateway")
         logger.debug("Loading config from %s", args.config)
@@ -91,7 +133,11 @@ def main(argv: list[str] | None = None) -> int:
             len(config.backends),
             ", ".join(sorted(config.backends)) or "none",
         )
-        app = create_app(config)
+        try:
+            app = create_app(config)
+        except EncryptionKeyError as exc:
+            logger.error("%s (see the README's 'Encryption key' section)", exc)
+            return 1
         uvicorn.run(
             app,
             host=config.server.host,

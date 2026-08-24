@@ -1,7 +1,12 @@
 """SQLite persistence for the gateway.
 
 Secrets are protected at rest:
-- OAuth client records and upstream credentials are encrypted with Fernet.
+- OAuth client records and upstream credentials are encrypted with Fernet,
+  using envelope encryption: a random Data Encryption Key (DEK) generated on
+  first run does the actual encrypting, and only that ~32-byte DEK is wrapped
+  by a Key Encryption Key (KEK) derived from the operator-supplied
+  `encryption_key`. This means rotating `encryption_key` (see `rotate_key`)
+  only has to re-wrap the DEK, not re-encrypt every row.
 - Access/refresh tokens and authorization codes are stored as SHA-256 hashes;
   the plaintext token never touches the database.
 
@@ -85,6 +90,14 @@ CREATE TABLE IF NOT EXISTS revoked_sessions (
 UNUSED_CLIENT_TTL_SECONDS = 24 * 60 * 60
 
 
+class EncryptionKeyError(RuntimeError):
+    """`encryption_key` doesn't match the key that last encrypted this database.
+
+    Raised at startup (see `Storage._init_encryption`) rather than left to
+    surface later as individual rows silently failing to decrypt.
+    """
+
+
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -113,20 +126,135 @@ class Storage:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._lock = threading.RLock()
-        self._fernet = self._init_fernet(encryption_key)
+        self._init_encryption(encryption_key)
 
-    def _init_fernet(self, encryption_key: str) -> Fernet:
-        # Accept a proper Fernet key directly; otherwise treat the value as a
-        # passphrase and stretch it with a per-database random salt.
+    def _kek_fernet(self, key: str) -> Fernet:
+        """Build the Key Encryption Key Fernet instance for an operator-supplied key.
+
+        Accepts a proper Fernet key directly; otherwise treats the value as a
+        passphrase and stretches it with a per-database random salt (shared
+        across whichever operator key(s) turn out to be passphrase-style).
+        """
         try:
-            return Fernet(encryption_key.encode())
+            return Fernet(key.encode())
         except (ValueError, TypeError):
             pass
         salt_hex = self._meta_get("kdf_salt")
         if salt_hex is None:
             salt_hex = secrets.token_hex(16)
             self._meta_set("kdf_salt", salt_hex)
-        return Fernet(_derive_fernet_key(encryption_key, bytes.fromhex(salt_hex)))
+        return Fernet(_derive_fernet_key(key, bytes.fromhex(salt_hex)))
+
+    def _init_encryption(self, encryption_key: str) -> None:
+        """Set up envelope encryption (see module docstring): unwrap the
+        stored DEK with the KEK derived from `encryption_key`, or -- on a
+        database that predates envelope encryption, or a brand-new one --
+        generate a DEK, migrate any legacy rows onto it, and persist it
+        wrapped by the KEK.
+        """
+        kek_fernet = self._kek_fernet(encryption_key)
+        wrapped_dek = self._meta_get("dek_wrapped")
+        if wrapped_dek is not None:
+            try:
+                self._dek = kek_fernet.decrypt(wrapped_dek.encode())
+            except InvalidToken as exc:
+                logger.error(
+                    "Stored data could not be decrypted with the configured "
+                    "encryption_key -- has it changed? Registered OAuth clients "
+                    "and upstream backend credentials will be unreadable until "
+                    "the correct key is restored. See the README's 'Encryption "
+                    "key' section for the rotate-key command and key-loss runbook."
+                )
+                raise EncryptionKeyError(
+                    "encryption_key does not match the key this database was encrypted with"
+                ) from exc
+            self._fernet = Fernet(self._dek)
+            return
+
+        # No wrapped DEK on record yet: either a brand-new database, or one
+        # created before envelope encryption was introduced (rows encrypted
+        # directly under the KEK). Generate a random DEK, migrate any such
+        # rows onto it (a no-op if there are none), then persist the DEK
+        # wrapped by the KEK.
+        self._dek = Fernet.generate_key()
+        new_fernet = Fernet(self._dek)
+        self._migrate_legacy_rows(kek_fernet, new_fernet)
+        self._fernet = new_fernet
+        self._meta_set("dek_wrapped", kek_fernet.encrypt(self._dek).decode())
+
+    _PLAINTEXT_META_KEYS = frozenset({"kdf_salt", "dek_wrapped"})
+
+    def _migrate_legacy_rows(self, old_fernet: Fernet, new_fernet: Fernet) -> None:
+        """Re-encrypt rows created before envelope encryption -- directly
+        under the KEK -- onto the new random DEK, so upgrading to this
+        version doesn't orphan existing data. A no-op on a fresh database.
+        """
+        migrated = 0
+        with self._lock:
+            clients = self._conn.execute("SELECT client_id, data FROM oauth_clients").fetchall()
+            for client_id, blob in clients:
+                try:
+                    plaintext = old_fernet.decrypt(blob)
+                except InvalidToken:
+                    continue  # not decryptable under the old key either; leave as-is
+                self._conn.execute(
+                    "UPDATE oauth_clients SET data=? WHERE client_id=?",
+                    (new_fernet.encrypt(plaintext), client_id),
+                )
+                migrated += 1
+
+            upstream = self._conn.execute(
+                "SELECT backend, key, value FROM upstream_data"
+            ).fetchall()
+            for backend, key, blob in upstream:
+                try:
+                    plaintext = old_fernet.decrypt(blob)
+                except InvalidToken:
+                    continue
+                self._conn.execute(
+                    "UPDATE upstream_data SET value=? WHERE backend=? AND key=?",
+                    (new_fernet.encrypt(plaintext), backend, key),
+                )
+                migrated += 1
+
+            meta_rows = self._conn.execute("SELECT key, value FROM meta").fetchall()
+            for key, value in meta_rows:
+                if key in self._PLAINTEXT_META_KEYS:
+                    continue
+                try:
+                    plaintext = old_fernet.decrypt(value.encode())
+                except InvalidToken:
+                    continue
+                self._conn.execute(
+                    "UPDATE meta SET value=? WHERE key=?",
+                    (new_fernet.encrypt(plaintext).decode(), key),
+                )
+                migrated += 1
+
+            self._conn.commit()
+        if migrated:
+            logger.info(
+                "Migrated %d row(s) to envelope encryption on first run under "
+                "this version (data now keyed by a random per-database key, "
+                "itself wrapped by encryption_key)",
+                migrated,
+            )
+
+    @classmethod
+    def rotate_key(cls, path: str | Path, old_key: str, new_key: str) -> None:
+        """Rotate the operator-supplied encryption key.
+
+        Only the ~32-byte DEK is re-wrapped under `new_key`; no data row is
+        touched, so this is O(1) regardless of database size. Raises
+        `EncryptionKeyError` if `old_key` doesn't match the key currently
+        protecting the database.
+        """
+        storage = cls(path, old_key)
+        try:
+            new_kek_fernet = storage._kek_fernet(new_key)
+            storage._meta_set("dek_wrapped", new_kek_fernet.encrypt(storage._dek).decode())
+        finally:
+            storage.close()
 
     def close(self) -> None:
         with self._lock:
@@ -155,7 +283,9 @@ class Storage:
             try:
                 return self._fernet.decrypt(existing.encode()).decode()
             except InvalidToken:
-                pass  # encryption key changed; regenerate
+                # The key itself is already validated at startup (see
+                # _init_encryption); this means the stored secret is corrupt.
+                logger.warning("Stored secret %r could not be decrypted; regenerating", name)
         value = secrets.token_urlsafe(nbytes)
         self._meta_set(name, self._fernet.encrypt(value.encode()).decode())
         return value
@@ -189,7 +319,13 @@ class Storage:
         try:
             return self._decrypt_json(row[0])
         except InvalidToken:
-            return None  # encryption key changed; treat as unknown client
+            # The key itself is already validated at startup (see
+            # _init_encryption), so this means the row is corrupt, not that
+            # encryption_key changed.
+            logger.warning(
+                "Client %s: stored record could not be decrypted (corrupt row?)", client_id
+            )
+            return None
 
     def mark_client_used(self, client_id: str) -> None:
         """Record that a client completed an authorization (exempts it from
@@ -364,6 +500,11 @@ class Storage:
         try:
             return self._decrypt_json(row[0])
         except InvalidToken:
+            logger.warning(
+                "Upstream %s/%s: stored credentials could not be decrypted (corrupt row?)",
+                backend,
+                key,
+            )
             return None
 
     def delete_upstream(self, backend: str, key: str | None = None) -> None:

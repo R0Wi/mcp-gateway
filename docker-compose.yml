@@ -3,6 +3,15 @@
 #   1. cp config.example.yaml config.yaml   (edit it)
 #   2. export MCP_GATEWAY_ENCRYPTION_KEY=$(openssl rand -base64 32)
 #   3. docker compose up -d
+#
+# The encryption key can instead be supplied as a Docker Compose secret file
+# (recommended for production -- keeps the key out of `docker inspect` /
+# `docker compose config` output; see the README's "Encryption key" section
+# and https://docs.docker.com/compose/how-tos/use-secrets/). To switch:
+#   1. openssl rand -base64 32 > secrets/encryption_key   (chmod 400 it)
+#   2. comment out the MCP_GATEWAY_ENCRYPTION_KEY line below and uncomment
+#      MCP_GATEWAY_ENCRYPTION_KEY_FILE, the service's `secrets:` list, and
+#      the top-level `secrets:` block
 services:
   mcp-gateway:
     build: .
@@ -10,6 +19,10 @@ services:
     environment:
       # secret referenced from config.yaml via ${...}
       MCP_GATEWAY_ENCRYPTION_KEY: ${MCP_GATEWAY_ENCRYPTION_KEY:?set MCP_GATEWAY_ENCRYPTION_KEY}
+      # Alternative to the env var above: a Docker Compose secret file (see
+      # the header comment). Set alongside a `secrets:` entry below; it
+      # takes precedence over MCP_GATEWAY_ENCRYPTION_KEY when set.
+      # MCP_GATEWAY_ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
       # needed if config.yaml has an upstream using GitHub OAuth
       # GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:?set GITHUB_OAUTH_CLIENT_ID}
       # GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:?set GITHUB_OAUTH_CLIENT_SECRET}
@@ -20,6 +33,12 @@ services:
       - gateway-data:/data
     ports:
       - "8000:8000"
+    # secrets:
+    #   - encryption_key
 
 volumes:
   gateway-data:
+
+# secrets:
+#   encryption_key:
+#     file: ./secrets/encryption_key

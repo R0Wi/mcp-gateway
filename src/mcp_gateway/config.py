@@ -84,8 +84,22 @@ class ServerConfig(BaseModel):
 class AuthConfig(BaseModel):
     users: list[UserConfig]
     # Fernet key (or arbitrary passphrase, which is stretched via scrypt) used to
-    # encrypt secrets at rest in the SQLite database.
+    # encrypt secrets at rest in the SQLite database. Normally supplied via
+    # ${MCP_GATEWAY_ENCRYPTION_KEY}; set MCP_GATEWAY_ENCRYPTION_KEY_FILE instead
+    # to read it from a file (e.g. a Docker/Compose secret) -- see
+    # _read_encryption_key_file() and the README's "Encryption key" section.
     encryption_key: str
+
+    @field_validator("encryption_key")
+    @classmethod
+    def _check_encryption_key(cls, v: str) -> str:
+        if not v:
+            raise ValueError(
+                "auth.encryption_key is empty -- set MCP_GATEWAY_ENCRYPTION_KEY or "
+                "MCP_GATEWAY_ENCRYPTION_KEY_FILE"
+            )
+        return v
+
     # Secret for signing browser session cookies; derived from encryption_key when unset.
     session_secret: str | None = None
     access_token_expiry_seconds: int = 3600
@@ -163,8 +177,57 @@ class GatewayConfig(BaseModel):
         return v
 
 
+def _read_encryption_key_file() -> str | None:
+    """Read the key from MCP_GATEWAY_ENCRYPTION_KEY_FILE, if set. Returns
+    None if the variable isn't set.
+
+    Deliberately does *not* go through os.environ (e.g. by setting
+    MCP_GATEWAY_ENCRYPTION_KEY and letting the normal ${...} expansion pick it
+    up): an environment variable is readable by anything sharing this
+    process's UID via /proc/<pid>/environ, gets swept up by crash-reporting/APM
+    tools' default "environment" capture, and is inherited by every child
+    process -- exactly the leak surface a file-based secret (Docker/Compose
+    `secrets:`, a Kubernetes `Secret` volume, a Vault Agent sidecar -- see
+    https://docs.docker.com/compose/how-tos/use-secrets/) is meant to avoid.
+    The value returned here is spliced directly into the parsed config dict
+    by load_config() instead, entirely in this process's own memory.
+    """
+    key_file = os.environ.get("MCP_GATEWAY_ENCRYPTION_KEY_FILE")
+    if not key_file:
+        return None
+    try:
+        return Path(key_file).read_text().strip()
+    except OSError as exc:
+        raise ValueError(
+            f"MCP_GATEWAY_ENCRYPTION_KEY_FILE={key_file!r} could not be read: {exc}"
+        ) from exc
+
+
 def load_config(path: str | Path) -> GatewayConfig:
     raw = yaml.safe_load(Path(path).read_text())
     if not isinstance(raw, dict):
         raise TypeError(f"Config file {path} must contain a YAML mapping")
-    return GatewayConfig.model_validate(_expand_tree(raw))
+    expanded = _expand_tree(raw)
+
+    key_from_file = _read_encryption_key_file()
+    if key_from_file is not None:
+        auth = expanded.setdefault("auth", {}) if isinstance(expanded, dict) else {}
+        if isinstance(auth, dict):
+            auth["encryption_key"] = key_from_file
+
+    return GatewayConfig.model_validate(expanded)
+
+
+def load_storage_path(path: str | Path) -> str:
+    """Read just `storage.path` from a config file, without requiring the
+    rest of the config -- notably `auth.encryption_key` -- to validate.
+
+    Used by `mcp-gateway rotate-key`, which supplies its own keys via
+    --old-key-file/--new-key-file and so doesn't need a working
+    encryption_key just to locate the database.
+    """
+    raw = yaml.safe_load(Path(path).read_text())
+    if not isinstance(raw, dict):
+        raise TypeError(f"Config file {path} must contain a YAML mapping")
+    storage_raw = _expand_tree(raw.get("storage") or {})
+    return str(storage_raw.get("path", StorageConfig().path))
