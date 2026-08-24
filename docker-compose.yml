@@ -6,12 +6,17 @@
 #
 # The encryption key can instead be supplied as a Docker Compose secret file
 # (recommended for production -- keeps the key out of `docker inspect` /
-# `docker compose config` output; see the README's "Encryption key" section
-# and https://docs.docker.com/compose/how-tos/use-secrets/). To switch:
+# `docker compose config` output; see the README's "Encryption key" section,
+# https://docs.docker.com/compose/how-tos/use-secrets/ and
+# https://phase.dev/blog/docker-compose-secrets/). To switch:
 #   1. openssl rand -base64 32 > secrets/encryption_key   (chmod 400 it)
 #   2. comment out the MCP_GATEWAY_ENCRYPTION_KEY line below and uncomment
 #      MCP_GATEWAY_ENCRYPTION_KEY_FILE, the service's `secrets:` list, and
 #      the top-level `secrets:` block
+#   The service's `secrets:` entry below uses the long syntax to mount the
+#   file as uid/gid 10001 (the container's non-root `gateway` user; see
+#   Dockerfile) with mode 0400, instead of Docker's default 0444 root:root --
+#   so only that user can read it inside the container.
 services:
   mcp-gateway:
     build: .
@@ -34,7 +39,11 @@ services:
     ports:
       - "8000:8000"
     # secrets:
-    #   - encryption_key
+    #   - source: encryption_key
+    #     target: encryption_key
+    #     uid: "10001"
+    #     gid: "10001"
+    #     mode: 0400
 
 volumes:
   gateway-data:
