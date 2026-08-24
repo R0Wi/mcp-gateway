@@ -36,7 +36,10 @@ def build_gateway(
             "Use the gateway_status tool to inspect configured backends."
         ),
         auth=provider,
-        mask_error_details=False,
+        # Don't leak backend URLs, HTTP error bodies or internal exception
+        # types to MCP clients; diagnose failures from the server logs
+        # instead (run with --log-level debug for detail).
+        mask_error_details=True,
     )
 
     @mcp.tool(name="gateway_status")
@@ -49,15 +52,27 @@ def build_gateway(
         if not backend.enabled:
             logger.info("Backend %s is disabled; skipping", name)
             continue
-        proxy = create_proxy(clients[name], name=f"proxy-{name}")
+        proxy = create_proxy(clients[name], name=f"proxy-{name}", mask_error_details=True)
         # FastMCP proxies forward the inbound Authorization header upstream by
         # default. That is token passthrough, which the MCP authorization spec
         # explicitly forbids: the gateway token issued to the MCP client must
         # never reach a backend. Backends only ever see credentials the
         # gateway itself holds (static headers or its own upstream OAuth tokens).
+        #
+        # This is the single most important invariant in the gateway, so fail
+        # startup loudly rather than silently no-op if a future fastmcp
+        # release renames or removes the attribute -- a silent no-op here
+        # would re-enable token passthrough with no error and no test
+        # failure to catch it.
         transport = getattr(clients[name], "transport", None)
-        if hasattr(transport, "forward_incoming_headers"):
-            transport.forward_incoming_headers = False
+        if not hasattr(transport, "forward_incoming_headers"):
+            raise RuntimeError(
+                f"Backend {name!r}: transport {type(transport).__name__} has no "
+                "'forward_incoming_headers' attribute; cannot guarantee the "
+                "no-token-passthrough invariant. This likely means the "
+                "installed fastmcp version changed its proxy transport API."
+            )
+        transport.forward_incoming_headers = False
         mcp.mount(proxy, namespace=name)
         logger.info("Mounted backend %s (%s, auth=%s)", name, backend.url, backend.auth.type)
 

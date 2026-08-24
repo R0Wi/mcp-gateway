@@ -36,7 +36,16 @@ async def test_connect_flow_and_proxying(two_gateways):
     gateway, upstream, app = two_gateways
     a, b = gateway.base_url, upstream.base_url
 
-    async with httpx.AsyncClient(follow_redirects=False, timeout=30) as http:
+    # Two separate clients/cookie jars, one per host, mirroring how a real
+    # browser scopes cookies per origin. Both servers happen to run on
+    # 127.0.0.1 in tests (different ports only), so a single shared jar would
+    # let the upstream's session cookie clobber the gateway's -- the gateway
+    # now requires a live session on /oauth/callback (see M-2), so that
+    # clobbering would incorrectly look like "not logged in".
+    async with (
+        httpx.AsyncClient(follow_redirects=False, timeout=30) as http,
+        httpx.AsyncClient(follow_redirects=False, timeout=30) as http_upstream,
+    ):
         # Connect endpoint requires a logged-in admin.
         r = await http.get(f"{a}/oauth/connect/up")
         assert r.status_code in (302, 307)
@@ -59,21 +68,21 @@ async def test_connect_flow_and_proxying(two_gateways):
         assert query["redirect_uri"] == [f"{a}/oauth/callback"]
 
         # Upstream parks the request for login/consent.
-        r = await http.get(authorize_url)
+        r = await http_upstream.get(authorize_url)
         txn = parse_qs(urlparse(r.headers["location"]).query)["txn"][0]
-        r = await http.post(f"{b}/auth/api/login", json={"username": "admin", "password": "pw"})
-        http.cookies.update(r.cookies)
-        r = await http.post(f"{b}/auth/api/consent", json={"txn_id": txn, "approve": True})
+        r = await http_upstream.post(
+            f"{b}/auth/api/login", json={"username": "admin", "password": "pw"}
+        )
+        http_upstream.cookies.update(r.cookies)
+        r = await http_upstream.post(f"{b}/auth/api/consent", json={"txn_id": txn, "approve": True})
         redirect_to = r.json()["redirect_to"]
         assert redirect_to.startswith(f"{a}/oauth/callback")
 
-        # Browser lands on the gateway callback; the gateway exchanges the code.
+        # Browser lands on the gateway callback (still carrying the gateway's
+        # own session cookie in `http`); the gateway exchanges the code.
         r = await http.get(redirect_to)
         assert "connected=up" in r.headers["location"], r.headers["location"]
 
-        # Same-host cookie clobbering in tests: log in to the gateway again.
-        r = await http.post(f"{a}/auth/api/login", json={"username": "admin", "password": "pw"})
-        http.cookies.update(r.cookies)
         r = await http.get(f"{a}/auth/api/backends")
         status = r.json()[0]
         assert status["connected"] is True

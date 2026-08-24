@@ -64,6 +64,16 @@ class ServerConfig(BaseModel):
     public_url: str
     host: str = "0.0.0.0"
     port: int = 8000
+    # Peers uvicorn trusts to set X-Forwarded-For / X-Forwarded-Proto (a
+    # reverse proxy's own address, or a comma-separated list of them).
+    # Trusting these headers from arbitrary clients lets them spoof their
+    # source IP (poisoning audit logs and rate limiting) and claim
+    # X-Forwarded-Proto: https on a plaintext connection. Defaults to
+    # loopback only, which covers `docker compose`'s common
+    # reverse-proxy-on-the-host pattern; set explicitly (e.g. the Docker
+    # bridge subnet, or "*" only if you fully trust the network path) when
+    # the proxy connects from elsewhere.
+    trusted_proxy_ips: str = "127.0.0.1"
 
     @field_validator("public_url")
     @classmethod

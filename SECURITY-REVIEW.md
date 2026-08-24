@@ -9,6 +9,34 @@ Every finding below marked **Confirmed** was reproduced against a running gatewa
 
 ---
 
+## Remediation status
+
+**All findings below (H-1 through I-4) have been fixed** on this branch, each with a
+regression test in `tests/test_security_hardening.py` (plus updates to
+`tests/test_upstream_oauth.py` and `tests/test_config_storage.py` for M-2 and L-3). The
+fixes were verified by re-running the original reproduction scripts from this review
+against the patched code and confirming each one now fails to reproduce (e.g. H-1's
+361x `/healthz` amplification is gone; M-1's 270 ms timing gap closed to <2 ms; M-3's
+anonymous registration flood now gets `429`). See the PR for the full diff. Summary:
+
+| # | Fix |
+|---|---|
+| H-1 | `bcrypt.checkpw` moved off the event loop (`anyio.to_thread.run_sync`); per-IP login rate limiting added |
+| M-1 / L-2 | `verify_user` rewritten: one real-cost bcrypt check per call regardless of username/password-kind, bytes-encoded before `compare_digest` |
+| M-2 | `/oauth/callback` requires a live session; the stateless "single active flow" fallback removed; a non-matching callback no longer touches flow state |
+| M-3 | unused DCR/CIMD clients reclaimed by TTL in `purge_expired` (now run on a periodic background task, not just at startup); `/register` rate-limited per IP |
+| M-4 | security-headers middleware added (CSP, `X-Frame-Options: DENY`, `Referrer-Policy`, `X-Content-Type-Options`) |
+| L-1 | `forwarded_allow_ips` now driven by a configurable `server.trusted_proxy_ips` (default: loopback only) instead of `"*"` |
+| L-3 | sessions carry a per-login id; logout revokes it server-side instead of only deleting the cookie |
+| L-4 | `mask_error_details=True` on the gateway and every mounted backend proxy |
+| L-5 | missing `forward_incoming_headers` now raises at startup instead of silently no-op'ing |
+| I-2 | startup warning when any user is configured with a plaintext password |
+| I-3 | `Cache-Control: no-store` added to the `/auth/api/*` surface |
+| I-4 | scrypt `n` raised to `2**17` (with `maxmem` raised to match) |
+| I-1 | documented as an intentional design constraint; no code change (flagged for if per-tool authorization is ever added) |
+
+---
+
 ## Summary
 
 | # | Severity | Finding | Component |

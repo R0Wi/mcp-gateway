@@ -207,7 +207,17 @@ mcp-gateway run -c config.yaml --log-level debug
   loopback redirects (CIMD localhost-impersonation guidance from the spec).
 - Tokens issued to MCP clients are never forwarded to backends, and backend
   credentials never reach MCP clients.
-- Sessions are signed (`itsdangerous`), `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS.
+- Sessions are signed (`itsdangerous`), `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS, and
+  are revoked server-side on logout (not just cookie deletion).
+- Login and Dynamic Client Registration (`/register`) are rate-limited per source IP;
+  password checks run off the event loop so a flood of attempts can't stall the server.
+- Anonymous DCR/CIMD client registrations that never complete an authorization are
+  reclaimed after 24h; storage doesn't grow unbounded from unauthenticated `/register` traffic.
+- Security headers (CSP, `X-Frame-Options: DENY`, `Referrer-Policy`, `X-Content-Type-Options`)
+  are set on every response.
+- `X-Forwarded-*` headers are trusted only from `server.trusted_proxy_ips` (default:
+  loopback). Set this to your reverse proxy's address if you run one — see
+  [Configuration](#configuration).
 - No credentials are logged.
 
 ## Development

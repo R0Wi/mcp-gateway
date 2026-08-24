@@ -98,8 +98,10 @@ def main(argv: list[str] | None = None) -> int:
             port=config.server.port,
             log_level=args.log_level,
             # The gateway sits behind a reverse proxy that terminates TLS.
+            # Only the configured peer(s) are trusted to set X-Forwarded-*
+            # (default: loopback only) -- see ServerConfig.trusted_proxy_ips.
             proxy_headers=True,
-            forwarded_allow_ips="*",
+            forwarded_allow_ips=config.server.trusted_proxy_ips,
         )
         return 0
 

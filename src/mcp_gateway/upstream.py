@@ -324,17 +324,23 @@ class BackendManager:
         """Route an upstream authorization callback to the waiting flow.
 
         Returns the backend name the callback was delivered to, or None.
+
+        Only an exact ``state`` match resolves a flow. There used to be a
+        fallback that guessed "the single active flow" whenever ``state`` was
+        absent or didn't match, on the theory that some non-conformant
+        servers drop it. That fallback let *any* request reach a pending
+        flow's one-shot callback future — including an anonymous request with
+        a forged ``state`` — permanently destroying an admin's in-progress
+        connect attempt (PKCE and the MCP SDK's own state check still stop
+        the forged code from ever being exchanged, but the legitimate flow is
+        consumed and has to be restarted). A request that fails to match is
+        now simply ignored, leaving any real pending flow untouched.
         """
-        flow: ConnectFlow | None = None
-        if state is not None:
-            flow = self._flows_by_state.pop(state, None)
-        if flow is None and len(self._flows_by_backend) == 1:
-            # Some servers drop the state parameter; with a single active flow
-            # the mapping is unambiguous.
-            flow = next(iter(self._flows_by_backend.values()))
+        flow: ConnectFlow | None = self._flows_by_state.get(state) if state is not None else None
         if flow is None or flow.callback.done():
             logger.warning("Received upstream OAuth callback with no matching connect flow")
             return None
+        self._flows_by_state.pop(state, None)
         logger.debug("Backend %s: delivering upstream OAuth callback", flow.backend)
         flow.callback.set_result((code, state))
         return flow.backend
