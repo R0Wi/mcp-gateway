@@ -8,10 +8,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 
+import anyio
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
@@ -45,6 +45,10 @@ def _require_session(request: Request) -> str:
     return user
 
 
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
 def build_auth_router() -> APIRouter:
     router = APIRouter(prefix="/auth/api")
 
@@ -63,9 +67,19 @@ def build_auth_router() -> APIRouter:
     @router.post("/login")
     async def login(body: LoginRequest, request: Request, response: Response):
         config = request.app.state.config
-        # Small fixed delay to blunt online guessing on this single-user AS.
-        await asyncio.sleep(0.3)
-        if not verify_user(config.auth, body.username, body.password):
+        if not request.app.state.login_limiter.allow(_client_ip(request)):
+            logger.warning("Login rate limit exceeded for %s", _client_ip(request))
+            raise HTTPException(status_code=429, detail="Too many login attempts, try again later")
+        # bcrypt.checkpw is a blocking CPU call; run it off the event loop so
+        # a flood of login attempts can't stall every other request (MCP
+        # traffic included) the way a fully synchronous checkpw would.
+        # verify_user() itself keeps a constant bcrypt cost across the
+        # known/unknown-username and hashed/plaintext-password cases, so the
+        # rate limiter above (not a per-request sleep) is what blunts guessing.
+        ok = await anyio.to_thread.run_sync(
+            verify_user, config.auth, body.username, body.password
+        )
+        if not ok:
             logger.warning("Failed login attempt for username %r", body.username)
             raise HTTPException(status_code=401, detail="Invalid username or password")
         logger.info("User %r logged in", body.username)
@@ -82,7 +96,9 @@ def build_auth_router() -> APIRouter:
         return {"username": body.username}
 
     @router.post("/logout")
-    async def logout(response: Response):
+    async def logout(request: Request, response: Response):
+        sessions: SessionManager = request.app.state.sessions
+        sessions.revoke(request.cookies.get(SESSION_COOKIE))
         response.delete_cookie(SESSION_COOKIE, path="/")
         return {"ok": True}
 
@@ -147,6 +163,14 @@ def build_oauth_router() -> APIRouter:
 
     @router.get("/oauth/callback")
     async def oauth_callback(request: Request):
+        # The connect flow can only have been started by a logged-in admin
+        # (see /oauth/connect above), and the same browser session carries
+        # through the redirect to the upstream AS and back. Requiring a
+        # session here means an anonymous request with a forged/guessed
+        # `state` is rejected before it can touch backend_manager state at
+        # all, rather than relying solely on deliver_callback's state match.
+        if _session_user(request) is None:
+            return RedirectResponse("/ui/backends?error=Sign+in+required+to+complete+authorization")
         params = request.query_params
         error = params.get("error")
         if error:

@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
     client_id TEXT PRIMARY KEY,
     data BLOB NOT NULL,          -- Fernet-encrypted JSON client record
     is_cimd INTEGER NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    last_used_at REAL            -- set when a client completes an authorization
 );
 CREATE TABLE IF NOT EXISTS auth_codes (
     code_hash TEXT PRIMARY KEY,
@@ -71,7 +72,17 @@ CREATE TABLE IF NOT EXISTS upstream_data (
     updated_at REAL NOT NULL,
     PRIMARY KEY (backend, key)
 );
+CREATE TABLE IF NOT EXISTS revoked_sessions (
+    session_id TEXT PRIMARY KEY,
+    expires_at REAL NOT NULL     -- the session's own natural expiry; safe to forget after
+);
 """
+
+# Anonymous DCR-registered clients that never complete an authorization are
+# reclaimed after this long, bounding storage growth from unauthenticated
+# /register spam. Clients that *have* authorized (last_used_at is set) are
+# never purged by age.
+UNUSED_CLIENT_TTL_SECONDS = 24 * 60 * 60
 
 
 def token_hash(token: str) -> str:
@@ -79,8 +90,17 @@ def token_hash(token: str) -> str:
 
 
 def _derive_fernet_key(secret: str, salt: bytes) -> bytes:
-    """Turn an arbitrary passphrase into a Fernet key via scrypt."""
-    key = hashlib.scrypt(secret.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    """Turn an arbitrary passphrase into a Fernet key via scrypt.
+
+    n=2**17 follows current OWASP guidance for password-derived keys; this
+    only runs once per process for a passphrase-style (non-Fernet-format)
+    encryption_key, so the extra cost is a one-off startup delay. scrypt's
+    working set is 128*N*r bytes (~128 MiB at these parameters); OpenSSL's
+    default 32 MiB cap would reject that, so raise maxmem accordingly.
+    """
+    key = hashlib.scrypt(
+        secret.encode(), salt=salt, n=2**17, r=8, p=1, dklen=32, maxmem=256 * 1024 * 1024
+    )
     return base64.urlsafe_b64encode(key)
 
 
@@ -170,6 +190,16 @@ class Storage:
             return self._decrypt_json(row[0])
         except InvalidToken:
             return None  # encryption key changed; treat as unknown client
+
+    def mark_client_used(self, client_id: str) -> None:
+        """Record that a client completed an authorization (exempts it from
+        the unused-client TTL in :meth:`purge_expired`)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE oauth_clients SET last_used_at=? WHERE client_id=?",
+                (time.time(), client_id),
+            )
+            self._conn.commit()
 
     # -- authorization transactions (pending login/consent) --------------------
 
@@ -346,6 +376,24 @@ class Storage:
                 )
             self._conn.commit()
 
+    # -- browser session revocation (logout) -----------------------------------------
+
+    def revoke_session(self, session_id: str, expires_at: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO revoked_sessions(session_id, expires_at) VALUES(?,?) "
+                "ON CONFLICT(session_id) DO NOTHING",
+                (session_id, expires_at),
+            )
+            self._conn.commit()
+
+    def is_session_revoked(self, session_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM revoked_sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+        return row is not None
+
     # -- housekeeping -------------------------------------------------------------------
 
     def purge_expired(self) -> None:
@@ -358,6 +406,18 @@ class Storage:
             cur = self._conn.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (now,))
             deleted += cur.rowcount
             cur = self._conn.execute("DELETE FROM auth_txns WHERE expires_at < ?", (now,))
+            deleted += cur.rowcount
+            cur = self._conn.execute(
+                "DELETE FROM revoked_sessions WHERE expires_at < ?", (now,)
+            )
+            deleted += cur.rowcount
+            # Anonymous DCR/CIMD clients that never completed an authorization
+            # are reclaimed after UNUSED_CLIENT_TTL_SECONDS; clients that have
+            # (last_used_at set) are kept indefinitely.
+            cur = self._conn.execute(
+                "DELETE FROM oauth_clients WHERE last_used_at IS NULL AND created_at < ?",
+                (now - UNUSED_CLIENT_TTL_SECONDS,),
+            )
             deleted += cur.rowcount
             self._conn.commit()
         logger.debug("Purged %d expired row(s) from storage", deleted)

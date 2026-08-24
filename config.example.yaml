@@ -9,6 +9,12 @@ server:
   public_url: https://mcp.example.com
   host: 0.0.0.0
   port: 8000
+  # Peer(s) allowed to set X-Forwarded-For / X-Forwarded-Proto. Defaults to
+  # loopback only. If you run a reverse proxy in front (for TLS), set this
+  # to its address (e.g. your Docker network's bridge/proxy container IP or
+  # CIDR) so client IPs and https detection are correct; otherwise leave the
+  # default so a client can't spoof its own address.
+  # trusted_proxy_ips: 127.0.0.1
 
 auth:
   # Key used to encrypt secrets at rest (registered clients, upstream tokens).
