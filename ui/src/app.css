@@ -10,6 +10,8 @@
   --ok: #16a34a;
   --warn-bg: #fef9c3;
   --warn-text: #713f12;
+  --logo-primary: #152c6b;
+  --logo-accent: #3556b8;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -25,6 +27,8 @@
     --ok: #4ade80;
     --warn-bg: #3b3417;
     --warn-text: #fde68a;
+    --logo-primary: #8fa3e0;
+    --logo-accent: #b7c6f2;
   }
 }
 
@@ -271,4 +275,35 @@ button:disabled {
 
 .topbar button {
   font-size: 0.8rem;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.25rem;
+}
+
+.brand h1 {
+  margin: 0;
+}
+
+.login-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.login-header h1 {
+  margin: 0 0 0.35rem;
+}
+
+.login-header .subtitle {
+  margin: 0;
+}
+
+.login-header svg {
+  flex-shrink: 0;
 }

@@ -1,6 +1,7 @@
 <script>
   import { api } from '../lib/api.js';
   import Login from '../lib/Login.svelte';
+  import Logo from '../lib/Logo.svelte';
 
   const params = new URLSearchParams(window.location.search);
 
@@ -78,12 +79,20 @@
   {#if loading}
     <div class="spinner">Loading…</div>
   {:else if !username}
-    <h1>MCP Gateway</h1>
-    <p class="subtitle">Sign in to manage backend connections.</p>
+    <div class="login-header">
+      <div>
+        <h1>MCP Gateway</h1>
+        <p class="subtitle">Sign in to manage backend connections.</p>
+      </div>
+      <Logo size={76} />
+    </div>
     <Login {onLogin} />
   {:else}
     <div class="topbar">
-      <h1>Backends</h1>
+      <div class="brand">
+        <Logo size={28} />
+        <h1>Backends</h1>
+      </div>
       <button class="secondary small" onclick={logout}>Sign out ({username})</button>
     </div>
     <p class="subtitle">

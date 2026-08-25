@@ -1,6 +1,7 @@
 <script>
   import { api } from '../lib/api.js';
   import Login from '../lib/Login.svelte';
+  import Logo from '../lib/Logo.svelte';
 
   const txnId = new URLSearchParams(window.location.search).get('txn');
 
@@ -57,13 +58,19 @@
     <h1>Authorization request</h1>
     <div class="error">{error}</div>
   {:else if !username}
-    <h1>Sign in to MCP Gateway</h1>
+    <div class="brand">
+      <Logo size={32} />
+      <h1>Sign in to MCP Gateway</h1>
+    </div>
     <p class="subtitle">
       <strong>{clientLabel}</strong> is requesting access to your MCP gateway.
     </p>
     <Login onLogin={(name) => (username = name)} />
   {:else}
-    <h1>Authorize access</h1>
+    <div class="brand">
+      <Logo size={28} />
+      <h1>Authorize access</h1>
+    </div>
     <p class="subtitle">Signed in as <strong>{username}</strong></p>
 
     <p>

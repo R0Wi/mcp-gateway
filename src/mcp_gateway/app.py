@@ -130,9 +130,11 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
             "Content-Security-Policy",
             # style-src allows 'unsafe-inline' because the built Svelte
             # components use a handful of static inline style="..." attributes
-            # (see ui/src/pages/*.svelte); script-src stays locked to 'self'
-            # so injected <script> content still cannot execute.
-            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            # (see ui/src/pages/*.svelte); img-src allows data: for the
+            # inline-SVG favicon (ui/index.html) -- no external image host
+            # is ever loaded; script-src stays locked to 'self' so injected
+            # <script> content still cannot execute.
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
             "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         )
         response.headers["Referrer-Policy"] = "no-referrer"
