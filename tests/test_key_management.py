@@ -145,9 +145,11 @@ def test_legacy_pre_envelope_database_is_migrated(tmp_path):
 
 def test_pre_last_used_at_database_gets_column_added(tmp_path):
     """A database created before `last_used_at` (and `mark_client_used` /
-    the unused-client purge) existed must not crash on reopen: the column
-    needs to be added to the existing `oauth_clients` table, since
-    `CREATE TABLE IF NOT EXISTS` does not retroactively add columns."""
+    the unused-client purge) existed must not crash on reopen: opening it
+    with `Storage` runs the Alembic migration chain (see db_migrations.py),
+    which must add the missing column to the existing `oauth_clients` table
+    rather than silently no-op'ing (as a plain `CREATE TABLE IF NOT EXISTS`
+    would)."""
     db_path = tmp_path / "old.db"
 
     # Build the old schema by hand: an `oauth_clients` table with no
