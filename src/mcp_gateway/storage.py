@@ -12,6 +12,11 @@ Secrets are protected at rest:
 
 The database is small and access is low-frequency (a personal gateway), so a
 single serialized SQLite connection is sufficient.
+
+The schema itself lives in `mcp_gateway.migrations` (Alembic); `__init__`
+below applies it (creating it from scratch on a brand-new database, or
+bringing an older one up to date) before doing anything else. See the
+README's "Database migrations" section.
 """
 
 from __future__ import annotations
@@ -29,59 +34,9 @@ from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
 
-logger = logging.getLogger(__name__)
+from mcp_gateway.db_migrations import run_migrations
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS oauth_clients (
-    client_id TEXT PRIMARY KEY,
-    data BLOB NOT NULL,          -- Fernet-encrypted JSON client record
-    is_cimd INTEGER NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL,
-    last_used_at REAL            -- set when a client completes an authorization
-);
-CREATE TABLE IF NOT EXISTS auth_codes (
-    code_hash TEXT PRIMARY KEY,
-    data TEXT NOT NULL,          -- JSON AuthorizationCode payload (no secrets)
-    expires_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS access_tokens (
-    token_hash TEXT PRIMARY KEY,
-    client_id TEXT NOT NULL,
-    scopes TEXT NOT NULL,
-    subject TEXT,
-    resource TEXT,
-    expires_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS refresh_tokens (
-    token_hash TEXT PRIMARY KEY,
-    client_id TEXT NOT NULL,
-    scopes TEXT NOT NULL,
-    subject TEXT,
-    resource TEXT,
-    expires_at REAL NOT NULL,
-    revoked INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS auth_txns (
-    txn_id TEXT PRIMARY KEY,
-    data TEXT NOT NULL,          -- JSON transaction state
-    expires_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS upstream_data (
-    backend TEXT NOT NULL,
-    key TEXT NOT NULL,           -- 'tokens' | 'client_info'
-    value BLOB NOT NULL,         -- Fernet-encrypted JSON
-    updated_at REAL NOT NULL,
-    PRIMARY KEY (backend, key)
-);
-CREATE TABLE IF NOT EXISTS revoked_sessions (
-    session_id TEXT PRIMARY KEY,
-    expires_at REAL NOT NULL     -- the session's own natural expiry; safe to forget after
-);
-"""
+logger = logging.getLogger(__name__)
 
 # Anonymous DCR-registered clients that never complete an authorization are
 # reclaimed after this long, bounding storage growth from unauthenticated
@@ -123,8 +78,7 @@ class Storage:
         if str(db_path) != ":memory:":
             db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        run_migrations(self._conn)
         self._lock = threading.RLock()
         self._init_encryption(encryption_key)
 

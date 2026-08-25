@@ -143,6 +143,54 @@ def test_legacy_pre_envelope_database_is_migrated(tmp_path):
     storage2.close()
 
 
+def test_pre_last_used_at_database_gets_column_added(tmp_path):
+    """A database created before `last_used_at` (and `mark_client_used` /
+    the unused-client purge) existed must not crash on reopen: opening it
+    with `Storage` runs the Alembic migration chain (see db_migrations.py),
+    which must add the missing column to the existing `oauth_clients` table
+    rather than silently no-op'ing (as a plain `CREATE TABLE IF NOT EXISTS`
+    would)."""
+    db_path = tmp_path / "old.db"
+
+    # Build the old schema by hand: an `oauth_clients` table with no
+    # `last_used_at` column, as it looked before that column was added.
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            data BLOB NOT NULL,
+            is_cimd INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL
+        );
+        """
+    )
+    raw.execute(
+        "INSERT INTO oauth_clients(client_id, data, is_cimd, created_at) VALUES(?,?,?,?)",
+        ("old-client", b"irrelevant-for-this-test", 0, time.time()),
+    )
+    raw.commit()
+    raw.close()
+
+    storage = Storage(db_path, "some-key")
+    try:
+        # Column must exist now, and both the write path (mark_client_used)
+        # and the read path (purge_expired) must work against it.
+        storage.mark_client_used("old-client")
+        storage.purge_expired()
+    finally:
+        storage.close()
+
+    raw2 = sqlite3.connect(db_path)
+    columns = {row[1] for row in raw2.execute("PRAGMA table_info(oauth_clients)")}
+    assert "last_used_at" in columns
+    (last_used_at,) = raw2.execute(
+        "SELECT last_used_at FROM oauth_clients WHERE client_id='old-client'"
+    ).fetchone()
+    assert last_used_at is not None
+    raw2.close()
+
+
 def test_rotate_key_reencrypts_dek_not_rows(tmp_path):
     db_path = tmp_path / "t.db"
     storage = Storage(db_path, "old-key")

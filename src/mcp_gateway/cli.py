@@ -40,6 +40,18 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("MCP_GATEWAY_CONFIG", "config.yaml"),
     )
 
+    migrate = sub.add_parser(
+        "migrate",
+        help="Apply pending database migrations and exit, without starting the server",
+    )
+    migrate.add_argument(
+        "-c",
+        "--config",
+        default=os.environ.get("MCP_GATEWAY_CONFIG", "config.yaml"),
+        help="Path to the YAML config file, used to find storage.path (default: "
+        "config.yaml or $MCP_GATEWAY_CONFIG)",
+    )
+
     rotate = sub.add_parser(
         "rotate-key",
         help="Rotate auth.encryption_key without re-encrypting the whole database",
@@ -98,6 +110,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "check":
         config = load_config(args.config)
         print(f"OK: {len(config.auth.users)} user(s), {len(config.backends)} backend(s)")
+        return 0
+
+    if args.command == "migrate":
+        from mcp_gateway.config import load_storage_path
+        from mcp_gateway.db_migrations import run_migrations_for_path
+
+        storage_path = load_storage_path(args.config)
+        run_migrations_for_path(storage_path)
+        print(f"Database at {storage_path} is up to date")
         return 0
 
     if args.command == "rotate-key":
