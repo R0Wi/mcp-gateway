@@ -191,6 +191,28 @@ def build_oauth_router() -> APIRouter:
     return router
 
 
+def _is_asset_path(rest: str) -> bool:
+    """Whether ``/ui/<rest>`` addresses a file rather than a client route.
+
+    Client-side routes ("", "authorize", "backends") never contain a dot in
+    their last segment, so a suffix is a reliable tell -- and everything Vite
+    emits lands under ``assets/``.
+    """
+    return rest.startswith("assets/") or "." in rest.rsplit("/", 1)[-1]
+
+
+def _static_cache_headers(rest: str) -> dict[str, str]:
+    """Cache policy for a served UI file.
+
+    Vite gives files under ``assets/`` content-hashed names, so they are safe
+    to cache forever. index.html must always be revalidated: a stale copy
+    would keep requesting asset names that a newer build has already dropped.
+    """
+    if rest.startswith("assets/"):
+        return {"Cache-Control": "public, max-age=31536000, immutable"}
+    return {"Cache-Control": "no-cache"}
+
+
 def build_ui_router() -> APIRouter:
     router = APIRouter()
 
@@ -201,15 +223,22 @@ def build_ui_router() -> APIRouter:
     @router.get("/ui")
     @router.get("/ui/{rest:path}")
     async def ui(rest: str = ""):
-        # Serve built assets; anything that is not a real file falls back to
-        # the SPA entry point (client-side routing).
-        candidate = (STATIC_DIR / rest).resolve() if rest else STATIC_DIR / "index.html"
-        if (
-            rest
-            and candidate.is_file()
-            and candidate.is_relative_to(STATIC_DIR.resolve())
-        ):
-            return FileResponse(candidate)
+        # Serve built assets; an unknown *route* falls back to the SPA entry
+        # point (client-side routing). A missing *file* must not: handing
+        # index.html to a <script type="module"> or <link rel="stylesheet">
+        # only yields an opaque "MIME type ('text/html') is not supported"
+        # console error and a blank page. That happens whenever a browser
+        # holds an index.html whose content-hashed asset names no longer
+        # exist on the server -- a stale cache, or a half-finished deploy
+        # where an old container is still serving the previous build.
+        static_root = STATIC_DIR.resolve()
+        if rest:
+            candidate = (STATIC_DIR / rest).resolve()
+            if candidate.is_file() and candidate.is_relative_to(static_root):
+                return FileResponse(candidate, headers=_static_cache_headers(rest))
+            if _is_asset_path(rest):
+                logger.warning("UI asset not found: /ui/%s", rest)
+                raise HTTPException(status_code=404, detail="Not found")
         index = STATIC_DIR / "index.html"
         if not index.exists():
             logger.error("UI assets not built; serving 503 for /ui/%s", rest)
@@ -220,6 +249,6 @@ def build_ui_router() -> APIRouter:
                 },
                 status_code=503,
             )
-        return FileResponse(index)
+        return FileResponse(index, headers=_static_cache_headers("index.html"))
 
     return router
