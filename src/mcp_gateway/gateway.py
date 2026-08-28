@@ -10,6 +10,8 @@ listing instead of breaking the whole gateway.
 
 from __future__ import annotations
 
+import base64
+import functools
 import logging
 
 from fastmcp import Client, FastMCP
@@ -19,36 +21,31 @@ from mcp.types import Icon
 from mcp_gateway.config import GatewayConfig
 from mcp_gateway.oauth_server import GatewayOAuthProvider
 from mcp_gateway.upstream import BackendManager
+from mcp_gateway.web import STATIC_DIR
 
 logger = logging.getLogger(__name__)
 
-# Same mark as the inline-SVG favicon in ui/index.html, advertised to MCP
-# clients (e.g. connector pickers) via the initialize response so the
-# gateway shows up with an icon instead of a blank/fallback avatar. Kept as
-# a data URI -- like the favicon -- so no external image host is ever
-# loaded (see the img-src CSP directive in app.py).
-_ICON_SVG = (
-    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 360 240'%3E"
-    "%3Ccircle cx='26' cy='156' r='13' fill='%23152C6B'/%3E"
-    "%3Cline x1='39' y1='156' x2='110' y2='156' stroke='%23152C6B' stroke-width='12' "
-    "stroke-linecap='round'/%3E"
-    "%3Cpath d='M 118 200 L 118 108 A 58 58 0 0 1 234 108 L 234 200' fill='none' "
-    "stroke='%23152C6B' stroke-width='20' stroke-linecap='round'/%3E"
-    "%3Cpath d='M 166 86 Q 171.2 106.8 192 112 Q 171.2 117.2 166 138 Q 160.8 117.2 140 112 "
-    "Q 160.8 106.8 166 86 Z' fill='%23152C6B'/%3E"
-    "%3Cpath d='M 204 77 Q 206.2 85.8 215 88 Q 206.2 90.2 204 99 Q 201.8 90.2 193 88 "
-    "Q 201.8 85.8 204 77 Z' fill='%233556B8'/%3E"
-    "%3Cpath d='M 244 156 H 271 A 18 18 0 0 0 289 138 V 114 A 18 18 0 0 1 307 96 H 316' "
-    "fill='none' stroke='%233556B8' stroke-width='12' stroke-linecap='round'/%3E"
-    "%3Cpath d='M 244 156 H 316' fill='none' stroke='%233556B8' stroke-width='12' "
-    "stroke-linecap='round'/%3E"
-    "%3Cpath d='M 244 156 H 271 A 18 18 0 0 1 289 174 V 198 A 18 18 0 0 0 307 216 H 316' "
-    "fill='none' stroke='%233556B8' stroke-width='12' stroke-linecap='round'/%3E"
-    "%3Ccircle cx='330' cy='96' r='13' fill='%233556B8'/%3E"
-    "%3Ccircle cx='330' cy='156' r='13' fill='%233556B8'/%3E"
-    "%3Ccircle cx='330' cy='216' r='13' fill='%233556B8'/%3E"
-    "%3C/svg%3E"
-)
+# Single source of truth for the gateway's mark: ui/public/favicon.svg,
+# copied verbatim into the built UI's static root by `npm run build` (see
+# ui/index.html, which points its own <link rel="icon"> at the same file).
+# Read it from there at runtime and re-encode as a data URI so MCP clients
+# (e.g. connector pickers) get the identical icon via the initialize
+# response's serverInfo.icons -- no second copy of the SVG to keep in sync.
+_FAVICON_PATH = STATIC_DIR / "favicon.svg"
+
+
+@functools.lru_cache(maxsize=1)
+def _server_icons() -> list[Icon]:
+    try:
+        svg = _FAVICON_PATH.read_bytes()
+    except OSError:
+        # UI not built yet (e.g. local dev, tests) -- omit the icon rather
+        # than failing gateway startup; see web.py's handling of the same
+        # missing-build case for /ui/.
+        logger.debug("Favicon not found at %s; MCP server will advertise no icon", _FAVICON_PATH)
+        return []
+    data_uri = "data:image/svg+xml;base64," + base64.b64encode(svg).decode("ascii")
+    return [Icon(src=data_uri, mimeType="image/svg+xml")]
 
 
 def build_gateway(
@@ -64,7 +61,7 @@ def build_gateway(
             "Tools are namespaced by backend name (e.g. github_create_issue). "
             "Use the gateway_status tool to inspect configured backends."
         ),
-        icons=[Icon(src=_ICON_SVG, mimeType="image/svg+xml")],
+        icons=_server_icons(),
         auth=provider,
         # Don't leak backend URLs, HTTP error bodies or internal exception
         # types to MCP clients; diagnose failures from the server logs
