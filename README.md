@@ -5,10 +5,22 @@ of any number of protected backend MCP servers, with a **spec-compliant OAuth 2.
 authorization server facing the MCP client** — the piece most existing gateways are
 missing.
 
-```
-Claude Code / Claude.ai ──OAuth 2.1 (DCR/CIMD + PKCE)──▶ MCP Gateway ──own credentials──▶ GitHub MCP
-                                                          │                              ▶ Microsoft Learn MCP
-                                                          └── /mcp (Streamable HTTP)      ▶ …more backends
+```mermaid
+flowchart LR
+    Client["Claude Code / Claude.ai"]
+
+    subgraph Gateway["MCP Gateway"]
+        MCP["/mcp\n(Streamable HTTP)"]
+    end
+
+    GitHub["GitHub MCP"]
+    Docs["Microsoft Learn MCP"]
+    More["…more backends"]
+
+    Client -- "OAuth 2.1\n(DCR/CIMD + PKCE)" --> MCP
+    MCP -- "own credentials" --> GitHub
+    MCP -- "own credentials" --> Docs
+    MCP -- "own credentials" --> More
 ```
 
 Built with **FastAPI + FastMCP**, configured by a **single YAML file**, stores its state
@@ -343,6 +355,51 @@ database to sanity-check it (`alembic -x db-path=/tmp/dev.db upgrade head`), the
 regression test in `tests/test_db_migrations.py`.
 
 ## Architecture
+
+```mermaid
+flowchart TB
+    MCPClient["MCP client\n(Claude Code / Claude.ai)"]
+    Browser["Browser\n(login / consent / backends UI)"]
+
+    subgraph Frontend["Frontend — ui/ (Svelte 5 + Vite SPA)"]
+        UI["Login · Consent · Backend connections"]
+    end
+
+    subgraph Backend["Backend — FastAPI + FastMCP (app.py / web.py)"]
+        subgraph ClientFacing["Client-facing — oauth_server.py"]
+            AS["OAuth 2.1 authorization server\nDCR · CIMD · PKCE · metadata"]
+            Consent["Login / consent transaction flow"]
+        end
+
+        subgraph Aggregation["Aggregation — gateway.py"]
+            Proxy["FastMCP server\nnamespaced tool/resource proxying"]
+        end
+
+        subgraph UpstreamLayer["Upstream — upstream.py"]
+            BackendClients["Backend clients\nnone · bearer · headers · oauth"]
+        end
+
+        subgraph Security["Security"]
+            Storage["Encrypted SQLite\n(Fernet, hashed tokens, bcrypt)"]
+        end
+    end
+
+    Upstream1["GitHub MCP"]
+    Upstream2["Microsoft Learn MCP"]
+    Upstream3["…more backends"]
+
+    MCPClient -- "/mcp (Streamable HTTP)\nBearer token" --> AS
+    Browser -- "/ui/authorize, /ui/backends" --> UI
+    UI -- "JSON API" --> Consent
+    AS --> Consent
+    AS -- "issues/validates tokens" --> Proxy
+    Consent -- "clients, sessions" --> Storage
+    Proxy -- "routes per backend namespace" --> BackendClients
+    BackendClients -- "tokens, client records" --> Storage
+    BackendClients -- "own credentials" --> Upstream1
+    BackendClients -- "own credentials" --> Upstream2
+    BackendClients -- "own credentials" --> Upstream3
+```
 
 - `src/mcp_gateway/oauth_server.py` — the client-facing OAuth AS. Builds on the MCP
   SDK's authorization-server handlers and FastMCP's CIMD manager rather than
