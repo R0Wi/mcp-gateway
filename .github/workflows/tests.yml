@@ -20,5 +20,20 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build UI
+        # test_ui_static.py serves the built Svelte app, so it needs to
+        # exist before pytest runs -- see ui/vite.config.js's outDir.
+        run: |
+          npm ci
+          npm run build
+        working-directory: ui
+
       - name: Run pytest
         run: pytest
