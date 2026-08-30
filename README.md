@@ -25,7 +25,10 @@ flowchart LR
 
 Built with **FastAPI + FastMCP**, configured by a **single YAML file**, stores its state
 in a single encrypted SQLite database, and ships as one small standalone container —
-no reverse proxy required, though you can put one in front of it for TLS.
+no reverse proxy required, though you can put one in front of it for TLS. Prebuilt
+images are published at
+[`ghcr.io/r0wi/mcp-gateway`](https://github.com/R0Wi/mcp-gateway/pkgs/container/mcp-gateway);
+building from source is only needed if you want to change the code.
 
 ## Features
 
@@ -76,6 +79,12 @@ cp .env.example .env
 $EDITOR .env                                           # set MCP_GATEWAY_ENCRYPTION_KEY (openssl rand -base64 32)
 docker compose up -d
 ```
+
+`docker compose up -d` pulls the prebuilt
+[`ghcr.io/r0wi/mcp-gateway`](https://github.com/R0Wi/mcp-gateway/pkgs/container/mcp-gateway)
+image by default — no build step required. If you want to run from source instead
+(e.g. to test local changes), uncomment the `build: .` line in `docker-compose.yml` and
+comment out `image:`.
 
 The gateway runs standalone and listens on `:8000`; `docker compose` picks up
 `MCP_GATEWAY_ENCRYPTION_KEY` from `.env` automatically. Put it behind a reverse proxy of
