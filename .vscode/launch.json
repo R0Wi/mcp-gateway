@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: mcp-gateway run",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "mcp_gateway.cli",
+            "args": [
+                "run",
+                "--config",
+                "${workspaceFolder}/config.yaml",
+                "--log-level",
+                "debug"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "justMyCode": true
+        }
+    ]
+}

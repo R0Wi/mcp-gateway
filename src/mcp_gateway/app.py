@@ -14,6 +14,7 @@ from mcp_gateway.config import GatewayConfig, load_config
 from mcp_gateway.gateway import build_gateway
 from mcp_gateway.oauth_server import GatewayOAuthProvider
 from mcp_gateway.ratelimit import RateLimiter
+from mcp_gateway.state import GatewayState
 from mcp_gateway.storage import Storage
 from mcp_gateway.upstream import BackendManager
 from mcp_gateway.users import SessionManager
@@ -95,6 +96,10 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
     session_secret = config.auth.session_secret or storage.get_or_create_secret(
         "session_secret"
     )
+    # Replace Starlette's plain, untyped State with GatewayState so every
+    # attribute set below (and every `get_state(request)` read in web.py) is
+    # type-checked and IDE-navigable instead of resolving to Any.
+    app.state = GatewayState()
     app.state.config = config
     app.state.storage = storage
     app.state.oauth_provider = provider

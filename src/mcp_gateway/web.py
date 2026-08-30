@@ -16,7 +16,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
-from mcp_gateway.users import SESSION_COOKIE, SessionManager, verify_user
+from mcp_gateway.state import get_state
+from mcp_gateway.users import SESSION_COOKIE, verify_user
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,7 @@ class ConsentRequest(BaseModel):
 
 
 def _session_user(request: Request) -> str | None:
-    sessions: SessionManager = request.app.state.sessions
-    return sessions.validate(request.cookies.get(SESSION_COOKIE))
+    return get_state(request).sessions.validate(request.cookies.get(SESSION_COOKIE))
 
 
 def _require_session(request: Request) -> str:
@@ -58,7 +58,7 @@ def build_auth_router() -> APIRouter:
 
     @router.get("/txn/{txn_id}")
     async def get_txn(txn_id: str, request: Request):
-        info = request.app.state.oauth_provider.describe_txn(txn_id)
+        info = get_state(request).oauth_provider.describe_txn(txn_id)
         if info is None:
             raise HTTPException(status_code=404, detail="Unknown or expired authorization request")
         info["username"] = _session_user(request)
@@ -66,8 +66,9 @@ def build_auth_router() -> APIRouter:
 
     @router.post("/login")
     async def login(body: LoginRequest, request: Request, response: Response):
-        config = request.app.state.config
-        if not request.app.state.login_limiter.allow(_client_ip(request)):
+        state = get_state(request)
+        config = state.config
+        if not state.login_limiter.allow(_client_ip(request)):
             logger.warning("Login rate limit exceeded for %s", _client_ip(request))
             raise HTTPException(status_code=429, detail="Too many login attempts, try again later")
         # bcrypt.checkpw is a blocking CPU call; run it off the event loop so
@@ -83,10 +84,9 @@ def build_auth_router() -> APIRouter:
             logger.warning("Failed login attempt for username %r", body.username)
             raise HTTPException(status_code=401, detail="Invalid username or password")
         logger.info("User %r logged in", body.username)
-        sessions: SessionManager = request.app.state.sessions
         response.set_cookie(
             SESSION_COOKIE,
-            sessions.create(body.username),
+            get_state(request).sessions.create(body.username),
             max_age=config.auth.login_session_expiry_seconds,
             httponly=True,
             secure=config.server.public_url.startswith("https://"),
@@ -97,15 +97,14 @@ def build_auth_router() -> APIRouter:
 
     @router.post("/logout")
     async def logout(request: Request, response: Response):
-        sessions: SessionManager = request.app.state.sessions
-        sessions.revoke(request.cookies.get(SESSION_COOKIE))
+        get_state(request).sessions.revoke(request.cookies.get(SESSION_COOKIE))
         response.delete_cookie(SESSION_COOKIE, path="/")
         return {"ok": True}
 
     @router.post("/consent")
     async def consent(body: ConsentRequest, request: Request):
         user = _require_session(request)
-        provider = request.app.state.oauth_provider
+        provider = get_state(request).oauth_provider
         try:
             redirect_to = provider.complete_authorization(
                 body.txn_id, subject=user, approve=body.approve
@@ -117,13 +116,14 @@ def build_auth_router() -> APIRouter:
     @router.get("/backends")
     async def backends(request: Request):
         _require_session(request)
-        return request.app.state.backend_manager.backend_status()
+        return get_state(request).backend_manager.backend_status()
 
     @router.post("/backends/{name}/disconnect")
     async def disconnect(name: str, request: Request):
         user = _require_session(request)
-        manager = request.app.state.backend_manager
-        if name not in request.app.state.config.backends:
+        state = get_state(request)
+        manager = state.backend_manager
+        if name not in state.config.backends:
             raise HTTPException(status_code=404, detail="Unknown backend")
         logger.info("User %r requested disconnect of backend %r", user, name)
         manager.disconnect(name)
@@ -140,7 +140,7 @@ def build_oauth_router() -> APIRouter:
         # Client ID Metadata Document the gateway presents to upstream
         # authorization servers (CIMD; draft-ietf-oauth-client-id-metadata-document).
         return JSONResponse(
-            request.app.state.backend_manager.client_metadata_document(),
+            get_state(request).backend_manager.client_metadata_document(),
             headers={"Cache-Control": "public, max-age=3600"},
         )
 
@@ -149,8 +149,9 @@ def build_oauth_router() -> APIRouter:
         user = _session_user(request)
         if user is None:
             return RedirectResponse(f"/ui/backends?login_next=connect:{name}")
-        manager = request.app.state.backend_manager
-        clients = request.app.state.backend_clients
+        state = get_state(request)
+        manager = state.backend_manager
+        clients = state.backend_clients
         if name not in clients:
             raise HTTPException(status_code=404, detail="Unknown or disabled backend")
         logger.info("User %r requested connect of backend %r", user, name)
@@ -179,7 +180,7 @@ def build_oauth_router() -> APIRouter:
         code, state = params.get("code"), params.get("state")
         if not code:
             raise HTTPException(status_code=400, detail="Missing authorization code")
-        manager = request.app.state.backend_manager
+        manager = get_state(request).backend_manager
         backend = manager.deliver_callback(code, state)
         if backend is None:
             return RedirectResponse("/ui/backends?error=No+matching+authorization+flow")
