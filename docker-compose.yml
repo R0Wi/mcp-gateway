@@ -4,6 +4,10 @@
 #   2. export MCP_GATEWAY_ENCRYPTION_KEY=$(openssl rand -base64 32)
 #   3. docker compose up -d
 #
+# By default this pulls the prebuilt ghcr.io/r0wi/mcp-gateway:latest image --
+# no build step required. To build from source instead (e.g. to test local
+# changes), comment out the `image:` line below and uncomment `build: .`.
+#
 # The encryption key can instead be supplied as a Docker Compose secret file
 # (recommended for production -- keeps the key out of `docker inspect` /
 # `docker compose config` output; see the README's "Encryption key" section,
@@ -19,7 +23,9 @@
 #   so only that user can read it inside the container.
 services:
   mcp-gateway:
-    build: .
+    image: ghcr.io/r0wi/mcp-gateway:latest
+    # Uncomment to build from source instead of pulling the published image:
+    # build: .
     restart: unless-stopped
     environment:
       # secret referenced from config.yaml via ${...}
