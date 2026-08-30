@@ -22,6 +22,18 @@ from mcp_gateway.web import build_auth_router, build_oauth_router, build_ui_rout
 
 logger = logging.getLogger(__name__)
 
+# fastmcp installs its own handler on the "fastmcp" logger the moment it's
+# imported (fastmcp/__init__.py -> configure_logging()), with propagate=False
+# and its own message format (plain or Rich-colored), independent of the
+# logging.basicConfig() setup in mcp_gateway/__init__.py. Strip that handler
+# and let the logger propagate instead, so fastmcp's own log lines share the
+# same format as everything else (mcp_gateway.*, httpx, mcp.server.*, ...).
+# Safe to do unconditionally here: build_gateway (imported above) imports
+# fastmcp, which has by this point already run its own configure_logging().
+_fastmcp_logger = logging.getLogger("fastmcp")
+_fastmcp_logger.handlers.clear()
+_fastmcp_logger.propagate = True
+
 # Housekeeping cadence: expired tokens/codes/transactions, revoked-session
 # records, and unused DCR/CIMD client registrations (see storage.py) are all
 # reclaimed on this interval, not just at startup.
