@@ -167,8 +167,22 @@ def main(argv: list[str] | None = None) -> int:
             # The gateway sits behind a reverse proxy that terminates TLS.
             # Only the configured peer(s) are trusted to set X-Forwarded-*
             # (default: loopback only) -- see ServerConfig.trusted_proxy_ips.
+            # ProxyHeadersMiddleware rewrites scope["client"] in place before
+            # the request reaches the app *and* before uvicorn's own access
+            # log line is emitted, so this is also what makes that log line
+            # (and every request.client.host read elsewhere, e.g. rate
+            # limiting) show the real client IP instead of the proxy's.
             proxy_headers=True,
             forwarded_allow_ips=config.server.trusted_proxy_ips,
+            # Skip uvicorn's own logging.config.dictConfig() call, which
+            # would otherwise attach separate, differently-formatted
+            # handlers to the "uvicorn"/"uvicorn.error"/"uvicorn.access"
+            # loggers with propagate=False. With no log_config, those
+            # loggers keep logging's default propagate=True and pick up the
+            # root handler/format installed by logging.basicConfig() above
+            # -- the same one every mcp_gateway/httpx/mcp.* log line uses --
+            # so access logs are formatted consistently with the rest.
+            log_config=None,
         )
         return 0
 

@@ -10,10 +10,13 @@ server:
   host: 0.0.0.0
   port: 8000
   # Peer(s) allowed to set X-Forwarded-For / X-Forwarded-Proto. Defaults to
-  # loopback only. If you run a reverse proxy in front (for TLS), set this
-  # to its address (e.g. your Docker network's bridge/proxy container IP or
-  # CIDR) so client IPs and https detection are correct; otherwise leave the
-  # default so a client can't spoof its own address.
+  # loopback only, which only covers a reverse proxy running on the Docker
+  # host itself. A proxy running in its own container instead (e.g.
+  # jwilder/nginx-proxy on the same Docker network) connects from its
+  # container IP, not 127.0.0.1 -- set this to that IP or the network's CIDR
+  # (`docker network inspect <network> | grep Subnet`) so client IPs (in
+  # logs, rate limiting, ...) and https detection are correct; otherwise
+  # leave the default so a client can't spoof its own address.
   # trusted_proxy_ips: 127.0.0.1
 
 auth:
