@@ -37,3 +37,25 @@ jobs:
 
       - name: Run pytest
         run: pytest
+
+  ruff:
+    # Independent of the pytest job above, so lint results come back without
+    # waiting on the UI build and the e2e OAuth suite.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        # Just the linter -- this job needs none of the runtime dependencies.
+        # Constraint mirrors the `dev` extra in pyproject.toml; keep them in sync.
+        run: pip install "ruff>=0.16.4"
+
+      - name: Run ruff
+        # Lint only. `ruff format --check` is deliberately not run: the tree is
+        # not currently format-clean, and reformatting it is a separate change.
+        run: ruff check --output-format=github .

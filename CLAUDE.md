@@ -22,12 +22,16 @@ uv venv && uv pip install -e ".[dev]"     # or: pip install -e ".[dev]"
 (cd ui && npm install && npm run build)   # build the Svelte UI — see gotcha below
 pytest                                    # full suite, incl. e2e OAuth flows over HTTP
 pytest tests/test_oauth_flow.py::test_name -x    # single test
-ruff check . && ruff format .             # line-length 100, target py311
+ruff check .                              # line-length 100, target py311; enforced in CI
 mcp-gateway run -c config.yaml --log-level debug
 ```
 
 `MCP_GATEWAY_LOG_LEVEL` (`debug`/`info`/…) sets the level outside Docker too;
 `--log-level` takes precedence.
+
+The tree is lint-clean but **not** `ruff format`-clean, and CI only runs `ruff check`.
+Don't run `ruff format .` across the repo as a drive-by — it touches 13 files and buries
+whatever you were actually changing.
 
 CLI subcommands: `run`, `check` (validate config and exit), `hash-password`,
 `migrate` (apply migrations without starting the server), `rotate-key
