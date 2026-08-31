@@ -31,4 +31,45 @@ export const api = {
   disconnect: (name) =>
     request(`/auth/api/backends/${encodeURIComponent(name)}/disconnect`, { method: 'POST' }),
   connect: (name) => request(`/oauth/connect/${encodeURIComponent(name)}`),
+
+  // Streams newline-delimited JSON progress events ({ check, status, detail? })
+  // as an async generator, so the caller can render each check live. Abort
+  // `signal` to cancel the in-flight test.
+  async *testConnection(name, signal) {
+    const res = await fetch(`/auth/api/backends/${encodeURIComponent(name)}/test-connection`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      signal,
+    });
+    if (!res.ok) {
+      let detail;
+      try {
+        detail = (await res.json())?.detail;
+      } catch {
+        /* non-JSON error response */
+      }
+      const err = new Error(detail || `Request failed (${res.status})`);
+      err.status = res.status;
+      throw err;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let newlineAt;
+        while ((newlineAt = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newlineAt);
+          buffer = buffer.slice(newlineAt + 1);
+          if (line.trim()) yield JSON.parse(line);
+        }
+      }
+      if (buffer.trim()) yield JSON.parse(buffer);
+    } finally {
+      reader.releaseLock();
+    }
+  },
 };

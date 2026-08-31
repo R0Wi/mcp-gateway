@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -527,3 +528,102 @@ class BackendManager:
                 entry["connected"] = True
             out.append(entry)
         return out
+
+    # ------------------------------------------------------------- connection test
+
+    async def _check_auth(self, name: str, backend: BackendConfig) -> str:
+        """Local, no-network check of whatever auth material is configured.
+
+        This doesn't by itself prove the backend *accepts* the credentials --
+        that's what the list_tools check (a real authenticated request) is
+        for -- only that the gateway actually holds something to send.
+        """
+        if backend.auth.type == "none":
+            return "No authentication configured"
+        if backend.auth.type == "oauth":
+            tokens = self.storage.get_upstream(name, "tokens")
+            if tokens is None:
+                raise NotConnectedError(
+                    f"Backend '{name}' has no stored OAuth tokens -- connect it first"
+                )
+            has_refresh = bool(tokens.get("refresh_token"))
+            return "OAuth tokens present" + (
+                " (refresh token available)" if has_refresh else " (no refresh token)"
+            )
+        if backend.auth.type == "bearer":
+            return "Static bearer token configured"
+        return "Static headers configured"
+
+    async def test_connection(self, name: str, client: Client) -> AsyncIterator[dict[str, Any]]:
+        """Run a live connection test against `name`, yielding progress events.
+
+        Each check yields a ``running`` event followed by an ``ok``/``error``
+        event, so a caller can stream live progress to a UI. Stops at the
+        first failing check -- there is no point listing tools on a backend
+        that couldn't even be pinged.
+        """
+        backend = self.config.backends[name]
+        # Set as soon as any check has reported a definitive result, so a
+        # cleanup-time exception from __aexit__ (e.g. closing the transport
+        # after a check already failed, or even after everything succeeded)
+        # is never mistaken for a fresh ping failure below.
+        reported = False
+
+        yield {"check": "ping", "status": "running"}
+        try:
+            async with client:
+                try:
+                    await client.ping()
+                except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+                    reported = True
+                    yield {
+                        "check": "ping",
+                        "status": "error",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                    }
+                    return
+                yield {"check": "ping", "status": "ok", "detail": "Ping succeeded"}
+
+                yield {"check": "auth", "status": "running"}
+                try:
+                    detail = await self._check_auth(name, backend)
+                except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+                    reported = True
+                    yield {
+                        "check": "auth",
+                        "status": "error",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                    }
+                    return
+                yield {"check": "auth", "status": "ok", "detail": detail}
+
+                yield {"check": "list_tools", "status": "running"}
+                try:
+                    tools = await client.list_tools()
+                except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+                    reported = True
+                    yield {
+                        "check": "list_tools",
+                        "status": "error",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                    }
+                    return
+                reported = True
+                yield {
+                    "check": "list_tools",
+                    "status": "ok",
+                    "detail": f"Listed {len(tools)} tool(s)",
+                }
+        except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+            if reported:
+                logger.debug(
+                    "Backend %s: ignoring cleanup error after connection test finished: %s",
+                    name,
+                    exc,
+                )
+                return
+            # Opening the client session itself failed (transport couldn't
+            # even connect) -- no check body above ran, so attribute it to
+            # ping, the check this replaces.
+            logger.info("Backend %s: connection test failed to open session: %s", name, exc)
+            yield {"check": "ping", "status": "error", "detail": f"{type(exc).__name__}: {exc}"}

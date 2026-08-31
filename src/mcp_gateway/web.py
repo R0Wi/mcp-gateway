@@ -8,13 +8,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import quote
 
 import anyio
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from mcp_gateway.state import get_state
@@ -138,6 +140,27 @@ def build_auth_router() -> APIRouter:
         logger.info("User %r requested disconnect of backend %r", user, name)
         manager.disconnect(name)
         return {"ok": True}
+
+    @router.post("/backends/{name}/test-connection")
+    async def test_connection(name: str, request: Request):
+        user = _require_session(request)
+        state = get_state(request)
+        if name not in state.config.backends:
+            raise HTTPException(status_code=404, detail="Unknown backend")
+        client = state.backend_clients.get(name)
+        if client is None:
+            raise HTTPException(status_code=404, detail="Backend is disabled")
+        logger.info("User %r requested connection test of backend %r", user, name)
+
+        async def events() -> AsyncIterator[str]:
+            # Newline-delimited JSON: the UI reads this as a stream and
+            # renders each check live rather than waiting for the whole test
+            # to finish. If the browser aborts the fetch (the modal's Cancel
+            # button), Starlette cancels this generator on the next await.
+            async for event in state.backend_manager.test_connection(name, client):
+                yield json.dumps(event) + "\n"
+
+        return StreamingResponse(events(), media_type="application/x-ndjson")
 
     return router
 

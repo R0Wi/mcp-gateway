@@ -3,6 +3,7 @@
   import Login from '../lib/Login.svelte';
   import Logo from '../lib/Logo.svelte';
   import Banner from '../lib/Banner.svelte';
+  import ConnectionTestModal from '../lib/ConnectionTestModal.svelte';
 
   const params = new URLSearchParams(window.location.search);
 
@@ -13,6 +14,8 @@
   // out and spins that one button while we wait on /oauth/connect. Cleared
   // on failure; left set on success since the page navigates away anyway.
   let connecting = $state(null);
+  // Name of the backend whose connection-test modal is open, if any.
+  let testing = $state(null);
   let error = $state(params.get('error') || '');
   let notice = $state(
     params.get('connected') ? `Backend "${params.get('connected')}" connected successfully.` : ''
@@ -162,37 +165,46 @@
             </div>
             <div class="url">{b.url}</div>
           </div>
-          {#if b.auth_type === 'oauth' && b.enabled}
+          {#if b.enabled}
             <div class="row">
-              {#if b.connected}
-                <button
-                  class="secondary small"
-                  disabled={connecting === b.name}
-                  onclick={() => disconnect(b.name)}
-                >
-                  Disconnect
-                </button>
-                <button
-                  class="secondary small"
-                  disabled={connecting === b.name}
-                  onclick={() => connect(b.name)}
-                >
-                  {#if connecting === b.name}<span class="spinner-icon"></span>Reconnecting…{:else}Reconnect{/if}
-                </button>
-              {:else}
-                <button
-                  class="primary small"
-                  style="margin-top: 0; width: auto"
-                  disabled={connecting === b.name}
-                  onclick={() => connect(b.name)}
-                >
-                  {#if connecting === b.name}<span class="spinner-icon"></span>Connecting…{:else}Connect{/if}
-                </button>
+              {#if b.auth_type === 'oauth'}
+                {#if b.connected}
+                  <button
+                    class="secondary small"
+                    disabled={connecting === b.name}
+                    onclick={() => disconnect(b.name)}
+                  >
+                    Disconnect
+                  </button>
+                  <button
+                    class="secondary small"
+                    disabled={connecting === b.name}
+                    onclick={() => connect(b.name)}
+                  >
+                    {#if connecting === b.name}<span class="spinner-icon"></span>Reconnecting…{:else}Reconnect{/if}
+                  </button>
+                {:else}
+                  <button
+                    class="primary small"
+                    style="margin-top: 0; width: auto"
+                    disabled={connecting === b.name}
+                    onclick={() => connect(b.name)}
+                  >
+                    {#if connecting === b.name}<span class="spinner-icon"></span>Connecting…{:else}Connect{/if}
+                  </button>
+                {/if}
               {/if}
+              <button class="secondary small" onclick={() => (testing = b.name)}>
+                Test connection
+              </button>
             </div>
           {/if}
         </div>
       {/each}
     </div>
+
+    {#if testing}
+      <ConnectionTestModal name={testing} onclose={() => (testing = null)} />
+    {/if}
   {/if}
 </div>

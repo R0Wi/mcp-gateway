@@ -120,4 +120,4 @@ Request flow, root to leaf:
 - Config values support `${ENV_VAR}` / `${ENV_VAR:-default}` expansion (`config.py`).
 
 `README.md` carries the operator-facing detail (deployment, encryption-key handling,
-endpoint table, hardening measures); `SECURITY-REVIEW.md` records the threat analysis.
+endpoint table, hardening measures).
