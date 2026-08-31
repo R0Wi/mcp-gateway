@@ -16,7 +16,7 @@ import logging
 
 from fastmcp import Client, FastMCP
 from fastmcp.server import create_proxy
-from mcp.types import Icon
+from mcp.types import Icon, ToolAnnotations
 
 from mcp_gateway.config import GatewayConfig
 from mcp_gateway.oauth_server import GatewayOAuthProvider
@@ -69,7 +69,27 @@ def build_gateway(
         mask_error_details=True,
     )
 
-    @mcp.tool(name="gateway_status")
+    # Status icon: simple circle with dot indicator
+    _status_icon_svg = (
+        '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">'
+        '<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="2" fill="none"/>'
+        '<circle cx="12" cy="12" r="5" fill="currentColor"/>'
+        '</svg>'
+    )
+    _status_icon_data_uri = (
+        "data:image/svg+xml;base64," +
+        base64.b64encode(_status_icon_svg.encode("utf-8")).decode("ascii")
+    )
+
+    @mcp.tool(
+        name="gateway_status",
+        annotations=ToolAnnotations(
+            title="Gateway Status",
+            readOnlyHint=True,
+            openWorldHint=False
+        ),
+        icons=[Icon(src=_status_icon_data_uri, mimeType="image/svg+xml")]
+    )
     def gateway_status() -> list[dict]:
         """List the backends configured in this gateway and their connection state."""
         logger.debug("gateway_status tool invoked")
