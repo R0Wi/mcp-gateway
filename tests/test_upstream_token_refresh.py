@@ -10,6 +10,11 @@ after a restart, the upstream returns 401, and the SDK's 401 handler goes
 straight to a full *interactive* re-authorization instead of trying the
 refresh token -- even though a perfectly good refresh token is in storage.
 
+`DbTokenStorage` persists the absolute expiry (`expires_at`) inside the
+token row itself and hands back an `expires_in` decayed to the token's
+remaining lifetime on every read; `_initialize` then just feeds that through
+the SDK's own `update_token_expiry` helper.
+
 These tests exercise both real-world GitHub token shapes (see
 https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens
 and
@@ -93,17 +98,57 @@ def storage(tmp_path):
     s.close()
 
 
-async def test_set_tokens_records_issued_at(storage):
+def backdate_expiry(storage: Storage, backend: str, expires_at: float) -> None:
+    """Rewrite the stored token row's absolute expiry directly, simulating a
+    token that (genuinely) expired while the gateway was down -- the way a
+    real access token's clock would have run out, not something a test can
+    get at through the public TokenStorage interface."""
+    data = dict(storage.get_upstream(backend, "tokens"))
+    data["expires_at"] = expires_at
+    storage.save_upstream(backend, "tokens", data)
+
+
+async def test_set_tokens_records_absolute_expiry(storage):
     token_storage = DbTokenStorage(storage, "github")
-    assert await token_storage.get_tokens_issued_at() is None
 
     before = time.time()
     await token_storage.set_tokens(OAuthToken.model_validate(GITHUB_APP_TOKEN_RESPONSE))
     after = time.time()
 
-    issued_at = await token_storage.get_tokens_issued_at()
-    assert issued_at is not None
-    assert before <= issued_at <= after
+    raw = storage.get_upstream("github", "tokens")
+    assert raw is not None
+    expires_at = raw["expires_at"]
+    assert before + GITHUB_APP_TOKEN_RESPONSE["expires_in"] <= expires_at
+    assert expires_at <= after + GITHUB_APP_TOKEN_RESPONSE["expires_in"]
+
+
+async def test_get_tokens_returns_decayed_expires_in(storage):
+    """`expires_in` is relative to when it was received by definition, so a
+    read a while after the write must return a smaller value than what was
+    originally issued -- not the original 28800 replayed verbatim."""
+    token_storage = DbTokenStorage(storage, "github")
+    await token_storage.set_tokens(OAuthToken.model_validate(GITHUB_APP_TOKEN_RESPONSE))
+
+    # Simulate time passing between the write and the read.
+    backdate_expiry(storage, "github", time.time() + 100)
+
+    tokens = await token_storage.get_tokens()
+    assert tokens is not None
+    assert 0 < tokens.expires_in <= 100
+
+
+async def test_get_tokens_falls_back_to_legacy_issued_at(storage):
+    """A row written by an older gateway version (separate `token_issued_at`
+    key, no `expires_at` on the token row itself) must still resolve to a
+    correct `expires_in` instead of forcing a reconnect."""
+    token_storage = DbTokenStorage(storage, "github")
+    legacy_row = dict(GITHUB_APP_TOKEN_RESPONSE)  # no "expires_at" key
+    storage.save_upstream("github", "tokens", legacy_row)
+    storage.save_upstream("github", "token_issued_at", {"issued_at": time.time() - 100})
+
+    tokens = await token_storage.get_tokens()
+    assert tokens is not None
+    assert 0 < tokens.expires_in <= GITHUB_APP_TOKEN_RESPONSE["expires_in"] - 100 + 1
 
 
 async def test_expiring_token_valid_immediately_after_restart(storage):
@@ -131,9 +176,9 @@ async def test_expired_token_triggers_proactive_refresh_after_restart(storage):
     await token_storage.set_tokens(OAuthToken.model_validate(GITHUB_APP_TOKEN_RESPONSE))
     await register_client_info(token_storage)
 
-    # Back-date issuance well past the 8h (28800s) expires_in, simulating the
-    # gateway having been restarted long after the access token died.
-    storage.save_upstream("github", "token_issued_at", {"issued_at": time.time() - 30000})
+    # Back-date the stored expiry well into the past, simulating the gateway
+    # having been restarted long after the access token died.
+    backdate_expiry(storage, "github", time.time() - 1000)
 
     provider = make_provider(storage)
     await provider._initialize()
@@ -144,23 +189,23 @@ async def test_expired_token_triggers_proactive_refresh_after_restart(storage):
     assert provider.context.can_refresh_token()
 
 
-async def test_refresh_rotates_issued_at(storage):
+async def test_refresh_rotates_expiry(storage):
     """GitHub rotates both the access and refresh token on every refresh
     ('once you use a refresh token, that refresh token and the old user
-    access token will no longer work') -- confirm each `set_tokens` call
-    (as used by the SDK's refresh handler) re-stamps issued_at so expiry
+    access token will no longer work') -- confirm each `set_tokens` call (as
+    used by the SDK's refresh handler) re-stamps `expires_at` so expiry
     tracking stays correct across rotations, not just the first grant."""
     token_storage = DbTokenStorage(storage, "github")
     await token_storage.set_tokens(OAuthToken.model_validate(GITHUB_APP_TOKEN_RESPONSE))
-    first_issued_at = await token_storage.get_tokens_issued_at()
+    first_expires_at = storage.get_upstream("github", "tokens")["expires_at"]
 
     rotated = dict(GITHUB_APP_TOKEN_RESPONSE)
     rotated["access_token"] = "gho_rotatedNewAccessToken"
     rotated["refresh_token"] = "ghr_rotatedNewRefreshToken"
     await token_storage.set_tokens(OAuthToken.model_validate(rotated))
-    second_issued_at = await token_storage.get_tokens_issued_at()
+    second_expires_at = storage.get_upstream("github", "tokens")["expires_at"]
 
-    assert second_issued_at is not None and second_issued_at >= first_issued_at
+    assert second_expires_at >= first_expires_at
     tokens = await token_storage.get_tokens()
     assert tokens.access_token == "gho_rotatedNewAccessToken"
     assert tokens.refresh_token == "ghr_rotatedNewRefreshToken"
@@ -174,13 +219,13 @@ async def test_non_expiring_classic_oauth_app_token_has_no_expiry(storage):
     token_storage = DbTokenStorage(storage, "github")
     await token_storage.set_tokens(OAuthToken.model_validate(GITHUB_OAUTH_APP_TOKEN_RESPONSE))
 
-    # issued_at is still recorded (harmless / for consistency)...
-    assert await token_storage.get_tokens_issued_at() is not None
+    # No expires_in on the token, so no absolute expiry is recorded at all.
+    assert "expires_at" not in storage.get_upstream("github", "tokens")
 
     provider = make_provider(storage)
     await provider._initialize()
 
-    # ...but since there's no expires_in, no absolute expiry is synthesized:
+    # ...and since there's no expires_in, no absolute expiry is synthesized:
     # the token is treated as valid forever, matching GitHub's own semantics.
     assert provider.context.token_expiry_time is None
     assert provider.context.is_token_valid()
