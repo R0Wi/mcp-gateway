@@ -266,6 +266,24 @@ button:disabled {
   text-align: center;
 }
 
+.spinner-icon {
+  display: inline-block;
+  width: 0.8em;
+  height: 0.8em;
+  border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: -0.15em;
+  margin-right: 0.4em;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .topbar {
   display: flex;
   justify-content: space-between;

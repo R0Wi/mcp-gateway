@@ -443,7 +443,9 @@ class BackendManager:
             return await asyncio.wait_for(flow.authorize_url, timeout=60)
         except TimeoutError:
             flow.task.cancel()
-            raise
+            raise TimeoutError(
+                f"Backend '{name}' did not redirect to an authorization endpoint within 60s"
+            ) from None
 
     def deliver_callback(self, code: str, state: str | None) -> str | None:
         """Route an upstream authorization callback to the waiting flow.

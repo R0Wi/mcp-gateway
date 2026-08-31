@@ -248,7 +248,7 @@ async def test_forged_callback_does_not_destroy_admin_connect_flow(run_server):
         r = await admin.post(f"{a}/auth/api/login", json={"username": "admin", "password": "pw"})
         admin.cookies.update(r.cookies)
         r = await admin.get(f"{a}/oauth/connect/up")
-        assert r.status_code in (302, 307)
+        assert r.status_code == 200
 
         # Anonymous attacker, no session, forged state: must not disturb the
         # admin's pending flow.
