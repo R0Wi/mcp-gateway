@@ -126,17 +126,6 @@ class DbTokenStorage(TokenStorage):
             return None
         data = dict(data)
         expires_at = data.pop("expires_at", None)
-        if expires_at is None:
-            # Legacy row written by an older gateway version, which recorded
-            # the issue time under a separate key instead of an absolute
-            # expiry alongside the token. Fall back to it so an
-            # already-deployed gateway isn't forced to reconnect; this can be
-            # dropped once no such rows remain.
-            legacy = self._storage.get_upstream(self._backend, "token_issued_at")
-            issued_at = legacy.get("issued_at") if legacy else None
-            expires_in = data.get("expires_in")
-            if issued_at is not None and expires_in is not None:
-                expires_at = issued_at + int(expires_in)
         if expires_at is not None:
             # expires_in is relative to when the token was received; decay it
             # to the remaining lifetime (negative once past expiry -- that's

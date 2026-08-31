@@ -137,20 +137,6 @@ async def test_get_tokens_returns_decayed_expires_in(storage):
     assert 0 < tokens.expires_in <= 100
 
 
-async def test_get_tokens_falls_back_to_legacy_issued_at(storage):
-    """A row written by an older gateway version (separate `token_issued_at`
-    key, no `expires_at` on the token row itself) must still resolve to a
-    correct `expires_in` instead of forcing a reconnect."""
-    token_storage = DbTokenStorage(storage, "github")
-    legacy_row = dict(GITHUB_APP_TOKEN_RESPONSE)  # no "expires_at" key
-    storage.save_upstream("github", "tokens", legacy_row)
-    storage.save_upstream("github", "token_issued_at", {"issued_at": time.time() - 100})
-
-    tokens = await token_storage.get_tokens()
-    assert tokens is not None
-    assert 0 < tokens.expires_in <= GITHUB_APP_TOKEN_RESPONSE["expires_in"] - 100 + 1
-
-
 async def test_expiring_token_valid_immediately_after_restart(storage):
     """A fresh access token, reloaded by a brand-new provider (a stand-in for
     the process having just restarted), is recognized as still valid --
