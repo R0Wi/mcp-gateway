@@ -1,6 +1,6 @@
-"""_drive_interactive_reauth (see mcp_gateway.upstream) drives the MCP SDK's
-private async_auth_flow generator directly instead of waiting for a real 401
-from the upstream server.
+"""_drive_interactive_reauth (see mcp_gateway.upstream) forces the MCP SDK's
+interactive OAuth authorization-code flow to run, instead of waiting for a
+real 401 from the upstream server.
 
 That's necessary because start_connect used to just ping the backend and
 wait for the SDK's redirect_handler to fire off the back of a 401 response.
@@ -13,17 +13,22 @@ until the whole connect attempt times out:
   methods (initialize/ping) unauthenticated and only enforces auth on tool
   calls
 
-The first two tests simulate the second case: every real request the mock
-backend sees succeeds (never a 401), so the fix under test must be the one
-forcing the interactive path itself, not merely clearing the stored token.
+``_drive_interactive_reauth`` wraps the provider in ``_ForcedChallengeAuth``,
+a thin ``httpx.Auth`` that relays request/response pairs between the
+provider's own generator and a real ``httpx.AsyncClient``, substituting a
+synthetic 401 for the probe's response unless the backend really did
+challenge. httpx itself then owns generator lifecycle, redirects, timeouts
+and response reads -- exactly the things a hand-rolled driver would have to
+get right on its own.
 
-The rest guard against hand-rolling a generator driver instead of using
-httpx's own (``Client._send_handling_auth``): forgetting to close the
-generator on error/cancellation leaks the lock ``async_auth_flow`` holds for
-its whole body forever, forgetting ``follow_redirects=True`` breaks any
-discovery/registration/token endpoint behind a redirect, and naively
-replaying the generator's very last step re-sends the original probe for
-real a second time.
+The first two tests simulate the second case above: every real request the
+mock backend sees succeeds (never a 401), so the fix under test must be the
+one forcing the interactive path itself, not merely clearing the stored
+token. The rest pin httpx's own behavior through the wrapper: closing the
+generator on error/cancellation releases the lock ``async_auth_flow`` holds
+for its whole body, redirects are followed through discovery/registration/
+token endpoints, and the generator's very last step -- replaying the
+original probe with the freshly-issued token -- is never sent for real.
 """
 
 from __future__ import annotations
@@ -149,7 +154,9 @@ async def test_drive_interactive_reauth_completes_without_a_real_401(storage, mo
     assert stored.access_token == "at-from-interactive-flow"
 
 
-async def test_drive_interactive_reauth_clears_a_still_valid_stored_token(storage, monkeypatch):
+async def test_drive_interactive_reauth_does_not_short_circuit_on_a_valid_stored_token(
+    storage, monkeypatch
+):
     """A stored, still-valid token must not short-circuit the interactive
     flow -- start_connect's whole point is to let the admin re-authorize
     on demand (e.g. after revoking access upstream)."""

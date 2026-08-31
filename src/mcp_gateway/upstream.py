@@ -89,24 +89,21 @@ class JsonTokenOAuthClientProvider(OAuthClientProvider):
         goes straight to a full *interactive* re-authorization -- it never
         tries the ``refresh_token`` grant -- so the flow dies with
         ``NotConnectedError`` even though a perfectly good, unexpired refresh
-        token is sitting in storage (see the redirect_handler below).
+        token is sitting in storage.
 
-        Reconstruct ``token_expiry_time`` from the token's own ``expires_in``
-        plus the timestamp it was issued at (persisted alongside it by
-        ``DbTokenStorage.set_tokens``), so ``is_token_valid()`` is accurate
-        immediately and the *proactive* refresh at the top of
-        ``async_auth_flow`` fires instead -- using the refresh token before
-        ever hitting a 401. Tokens with no ``expires_in`` (e.g. classic GitHub
-        OAuth App tokens, which don't expire) are left with no expiry, same as
-        upstream default behaviour.
+        ``DbTokenStorage.get_tokens`` already decays the stored ``expires_in``
+        to the token's remaining lifetime, so the SDK's own
+        ``update_token_expiry`` helper is enough to reconstruct
+        ``token_expiry_time`` here -- no separate bookkeeping needed. This
+        override still has to exist: ``_initialize`` is the only place stored
+        tokens enter the context, and the SDK deliberately doesn't call
+        ``update_token_expiry`` there itself. Tokens with no ``expires_in``
+        (e.g. classic GitHub OAuth App tokens, which don't expire) are left
+        with no expiry, same as upstream default behaviour.
         """
         await super()._initialize()
-        tokens = self.context.current_tokens
-        storage = self.context.storage
-        if tokens and tokens.expires_in and isinstance(storage, DbTokenStorage):
-            issued_at = await storage.get_tokens_issued_at()
-            if issued_at is not None:
-                self.context.token_expiry_time = issued_at + int(tokens.expires_in)
+        if self.context.current_tokens is not None:
+            self.context.update_token_expiry(self.context.current_tokens)
 
 
 class DbTokenStorage(TokenStorage):
@@ -125,20 +122,22 @@ class DbTokenStorage(TokenStorage):
 
     async def get_tokens(self) -> OAuthToken | None:
         data = self._storage.get_upstream(self._backend, "tokens")
-        return OAuthToken.model_validate(data) if data else None
+        if not data:
+            return None
+        data = dict(data)
+        expires_at = data.pop("expires_at", None)
+        if expires_at is not None:
+            # expires_in is relative to when the token was received; decay it
+            # to the remaining lifetime (negative once past expiry -- that's
+            # fine, calculate_token_expiry just produces a past timestamp).
+            data["expires_in"] = int(expires_at - time.time())
+        return OAuthToken.model_validate(data)
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
-        self._storage.save_upstream(self._backend, "tokens", tokens.model_dump(mode="json"))
-        # Recorded under its own key -- deliberately not inferred from the
-        # generic `upstream_data.updated_at` audit column, which also gets
-        # touched by unrelated writes (e.g. client_info) and isn't obviously
-        # "this is when the access token's expires_in started counting down"
-        # to a reader. See JsonTokenOAuthClientProvider._initialize.
-        self._storage.save_upstream(self._backend, "token_issued_at", {"issued_at": time.time()})
-
-    async def get_tokens_issued_at(self) -> float | None:
-        data = self._storage.get_upstream(self._backend, "token_issued_at")
-        return data.get("issued_at") if data else None
+        data = tokens.model_dump(mode="json")
+        if tokens.expires_in is not None:
+            data["expires_at"] = time.time() + tokens.expires_in
+        self._storage.save_upstream(self._backend, "tokens", data)
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         if self._static_client_info is not None:
@@ -154,69 +153,71 @@ class DbTokenStorage(TokenStorage):
         )
 
 
-async def _drive_interactive_reauth(provider: OAuthClientProvider) -> None:
-    """Force the SDK's interactive OAuth authorization-code flow.
+class _ForcedChallengeAuth(httpx.Auth):
+    """Wraps an OAuthClientProvider so its interactive path always runs.
 
     ``async_auth_flow`` only takes the interactive path when a request comes
     back 401 -- but some backends (observed with GitHub's Copilot MCP server)
     happily answer basic protocol methods like ``initialize``/``ping``
-    unauthenticated and only enforce auth on tool calls. For those, no ping
+    unauthenticated and only enforce auth on tool calls. For those, no probe
     ever 401s, ``redirect_handler`` never runs, and a connect attempt driven
     by plain ``client.ping()`` waits out ``start_connect``'s timeout without
-    ever producing an authorize URL -- even with a cleared token (see
-    ``start_connect``).
+    ever producing an authorize URL.
 
-    This drives the very same generator ``async_auth_flow`` uses, directly.
-    The probe request is sent for real first, so a conformant server's actual
-    401 (and its ``WWW-Authenticate`` header -- resource metadata URL, scope
-    hint) is used exactly as ``async_auth_flow`` would use it; only when the
-    real response *isn't* a 401 do we substitute a synthetic one, to force
-    the discovery -> registration -> redirect -> token-exchange path
-    unconditionally. Every step after that is a real request sent for real.
+    Relays every request/response pair between ``httpx.AsyncClient`` and the
+    provider's own generator untouched, with two exceptions:
 
-    Two things ``httpx``'s own ``Auth`` driver (``Client._send_handling_auth``)
-    does that a naive hand-rolled loop must not skip:
+    - the probe's response is replaced by a synthetic 401 unless the backend
+      really did challenge (a real 401 is passed through so its
+      ``WWW-Authenticate`` header -- resource metadata URL, scope hint -- is
+      used exactly as ``async_auth_flow`` would use it);
+    - the flow's last step, replaying the probe with the freshly issued
+      token, is dropped: nothing here reads that response, and a GET against
+      a streamable-HTTP endpoint can block on an open SSE stream.
 
-    - ``async_auth_flow`` holds ``self.context.lock`` for its entire body, so
-      the generator must be explicitly closed (``aclose()``) in a
-      ``finally`` -- otherwise an exception or a cancelled task (both routine
-      here: ``start_connect`` cancels stale/timed-out flows) abandons the
-      generator mid-``yield`` with the lock held forever, wedging every later
-      connect attempt *and* every proactive token refresh for this backend.
-    - redirects must be followed (``follow_redirects=True``), matching the
-      SDK's own client (``create_mcp_http_client``), or a 30x anywhere in
-      discovery/registration/token-exchange breaks the flow.
-
-    We also don't resend the generator's very last step -- the original probe
-    replayed with the freshly-obtained ``Authorization`` header once tokens
-    are already persisted. Nothing here needs that response, and replaying a
-    bare probe request for real risks blocking on a streaming response we
-    don't care about.
+    Everything else -- generator lifecycle (``httpx`` closes it in a
+    ``finally`` regardless of how the flow ends), redirects, timeouts,
+    proxy/TLS config, response reads -- is handled by ``httpx.AsyncClient``
+    itself, the same as for any real request the provider would ever see.
     """
-    if not provider._initialized:
-        await provider._initialize()
-    provider.context.clear_tokens()
 
-    probe_request = httpx.Request("GET", provider.context.server_url)
-    gen = provider.async_auth_flow(probe_request)
-    try:
-        request = await gen.__anext__()
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http:
-            response = await http.send(request)
-            if response.status_code != 401:
-                response = httpx.Response(401, request=request)
+    requires_response_body = True
+
+    def __init__(self, provider: OAuthClientProvider) -> None:
+        self._provider = provider
+
+    async def async_auth_flow(self, request: httpx.Request):
+        inner = self._provider.async_auth_flow(request)
+        try:
+            outgoing = await inner.__anext__()
+            probe_sent = False
             while True:
+                # async_auth_flow yields the *same* request object it was
+                # given for the probe and, after the token exchange, for the
+                # authenticated replay. Everything else (refresh, discovery,
+                # registration, token exchange) is a request it built itself.
+                is_probe = outgoing is request
+                if is_probe and probe_sent:
+                    return
+                response = yield outgoing
+                if is_probe:
+                    probe_sent = True
+                    if response.status_code != 401:
+                        response = httpx.Response(401, request=outgoing)
                 try:
-                    request = await gen.asend(response)
+                    outgoing = await inner.asend(response)
                 except StopAsyncIteration:
                     return
-                if provider.context.current_tokens is not None:
-                    # Token exchange already completed and persisted -- what's
-                    # left is only the final replay of the original probe.
-                    return
-                response = await http.send(request)
-    finally:
-        await gen.aclose()
+        finally:
+            await inner.aclose()
+
+
+async def _drive_interactive_reauth(provider: OAuthClientProvider) -> None:
+    """Force a fresh interactive authorization for `provider`."""
+    async with httpx.AsyncClient(
+        timeout=30.0, follow_redirects=True, auth=_ForcedChallengeAuth(provider)
+    ) as http:
+        await http.get(provider.context.server_url)
 
 
 class ConnectFlow:
@@ -409,12 +410,7 @@ class BackendManager:
 
         flow = ConnectFlow(name)
         self._flows_by_backend[name] = flow
-        provider = self._oauth_providers.get(name)
-        if provider is None:
-            # build_client() (called for every configured backend at startup,
-            # and always before a UI-triggered connect can reach this code)
-            # always registers an OAuth backend's provider here first.
-            raise RuntimeError(f"Backend '{name}' has no OAuth provider; build_client() was not called")
+        provider = self._build_oauth_provider(name, backend)
 
         async def drive() -> None:
             # Force a fresh authorization via _drive_interactive_reauth
@@ -424,11 +420,7 @@ class BackendManager:
             # some backends never 401 basic protocol methods at all -- either
             # way a plain client.ping() can succeed without ever reaching the
             # redirect_handler, leaving authorize_url unresolved until this
-            # whole connect attempt times out. Only the in-memory context is
-            # cleared, not stored tokens: see the _initialized reset below
-            # for how a failed/cancelled attempt recovers a still-valid
-            # stored token.
-            succeeded = False
+            # whole connect attempt times out.
             try:
                 await _drive_interactive_reauth(provider)
                 # Confirm the freshly-obtained token actually works end to
@@ -437,7 +429,6 @@ class BackendManager:
                     await client.ping()
                 logger.info("Backend %s: OAuth connect flow succeeded", name)
                 flow.done.set_result(None)
-                succeeded = True
             except Exception as exc:  # noqa: BLE001 - report to the waiting UI
                 logger.warning("Backend %s: OAuth connect flow failed: %s", name, exc)
                 if not flow.done.done():
@@ -446,15 +437,6 @@ class BackendManager:
                     flow.authorize_url.set_exception(
                         RuntimeError(f"Authorization failed: {exc}")
                     )
-            finally:
-                # Anything other than a clean success (including cancellation,
-                # which bypasses the except above entirely) leaves the
-                # in-memory tokens we cleared empty. Drop _initialized so the
-                # *next* use of this provider reloads from storage -- which
-                # still has whatever was there before this attempt -- instead
-                # of being stuck treating the backend as disconnected.
-                if not succeeded:
-                    provider._initialized = False
 
         flow.task = asyncio.create_task(drive())
         try:
