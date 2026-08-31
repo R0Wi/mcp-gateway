@@ -30,4 +30,5 @@ export const api = {
   backends: () => request('/auth/api/backends'),
   disconnect: (name) =>
     request(`/auth/api/backends/${encodeURIComponent(name)}/disconnect`, { method: 'POST' }),
+  connect: (name) => request(`/oauth/connect/${encodeURIComponent(name)}`),
 };

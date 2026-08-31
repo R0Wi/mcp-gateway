@@ -2,16 +2,32 @@
   import { api } from '../lib/api.js';
   import Login from '../lib/Login.svelte';
   import Logo from '../lib/Logo.svelte';
+  import Banner from '../lib/Banner.svelte';
 
   const params = new URLSearchParams(window.location.search);
 
   let username = $state(null);
   let backends = $state([]);
   let loading = $state(true);
+  // Name of the backend currently starting a connect flow, if any -- greys
+  // out and spins that one button while we wait on /oauth/connect. Cleared
+  // on failure; left set on success since the page navigates away anyway.
+  let connecting = $state(null);
   let error = $state(params.get('error') || '');
   let notice = $state(
     params.get('connected') ? `Backend "${params.get('connected')}" connected successfully.` : ''
   );
+
+  // The error/connected params only ever come from the one-shot redirect
+  // the backend issues from /oauth/callback (the browser returning from the
+  // upstream authorization server, which can't be a fetch); once shown, drop
+  // them so a reload or share of the URL doesn't replay a stale banner.
+  if (params.has('error') || params.has('connected')) {
+    params.delete('error');
+    params.delete('connected');
+    const rest = params.toString();
+    window.history.replaceState(null, '', `/ui/backends${rest ? `?${rest}` : ''}`);
+  }
 
   $effect(() => {
     init();
@@ -42,7 +58,7 @@
       await refresh();
       const next = params.get('login_next');
       if (next?.startsWith('connect:')) {
-        window.location.href = `/oauth/connect/${encodeURIComponent(next.slice(8))}`;
+        await connect(next.slice(8));
         return;
       }
     } catch (e) {
@@ -59,6 +75,25 @@
       await api.disconnect(name);
       await refresh();
     } catch (e) {
+      error = e.message;
+    }
+  }
+
+  async function connect(name) {
+    error = '';
+    connecting = name;
+    try {
+      const { authorize_url } = await api.connect(name);
+      // Success leaves the page via a real navigation to the upstream
+      // authorization server; failure stays put and shows a dismissible
+      // banner instead of round-tripping through a server redirect.
+      window.location.href = authorize_url;
+    } catch (e) {
+      connecting = null;
+      if (e.status === 401) {
+        window.location.href = `/ui/backends?login_next=connect:${encodeURIComponent(name)}`;
+        return;
+      }
       error = e.message;
     }
   }
@@ -100,10 +135,10 @@
     </p>
 
     {#if notice}
-      <div class="notice">{notice}</div>
+      <Banner kind="notice" onclose={() => (notice = '')}>{notice}</Banner>
     {/if}
     {#if error}
-      <div class="error">{error}</div>
+      <Banner kind="error" onclose={() => (error = '')}>{error}</Banner>
     {/if}
 
     {#if backends.length === 0}
@@ -130,16 +165,29 @@
           {#if b.auth_type === 'oauth' && b.enabled}
             <div class="row">
               {#if b.connected}
-                <button class="secondary small" onclick={() => disconnect(b.name)}>
+                <button
+                  class="secondary small"
+                  disabled={connecting === b.name}
+                  onclick={() => disconnect(b.name)}
+                >
                   Disconnect
                 </button>
-                <a href={`/oauth/connect/${encodeURIComponent(b.name)}`}>
-                  <button class="secondary small">Reconnect</button>
-                </a>
+                <button
+                  class="secondary small"
+                  disabled={connecting === b.name}
+                  onclick={() => connect(b.name)}
+                >
+                  {#if connecting === b.name}<span class="spinner-icon"></span>Reconnecting…{:else}Reconnect{/if}
+                </button>
               {:else}
-                <a href={`/oauth/connect/${encodeURIComponent(b.name)}`}>
-                  <button class="primary small" style="margin-top: 0; width: auto">Connect</button>
-                </a>
+                <button
+                  class="primary small"
+                  style="margin-top: 0; width: auto"
+                  disabled={connecting === b.name}
+                  onclick={() => connect(b.name)}
+                >
+                  {#if connecting === b.name}<span class="spinner-icon"></span>Connecting…{:else}Connect{/if}
+                </button>
               {/if}
             </div>
           {/if}

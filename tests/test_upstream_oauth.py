@@ -48,8 +48,7 @@ async def test_connect_flow_and_proxying(two_gateways):
     ):
         # Connect endpoint requires a logged-in admin.
         r = await http.get(f"{a}/oauth/connect/up")
-        assert r.status_code in (302, 307)
-        assert "/ui/backends" in r.headers["location"]
+        assert r.status_code == 401
 
         r = await http.post(f"{a}/auth/api/login", json={"username": "admin", "password": "pw"})
         http.cookies.update(r.cookies)
@@ -58,10 +57,12 @@ async def test_connect_flow_and_proxying(two_gateways):
         assert r.json()[0]["connected"] is False
 
         # Start the connect flow: gateway discovers upstream metadata, performs
-        # DCR, and redirects the admin's browser to the upstream /authorize.
+        # DCR, and hands the admin's browser the upstream /authorize URL as JSON
+        # (the frontend navigates there itself; it's not a redirect from the
+        # gateway, so a failure to start can show a dismissible banner instead).
         r = await http.get(f"{a}/oauth/connect/up")
-        assert r.status_code in (302, 307)
-        authorize_url = r.headers["location"]
+        assert r.status_code == 200
+        authorize_url = r.json()["authorize_url"]
         assert authorize_url.startswith(f"{b}/authorize")
         query = parse_qs(urlparse(authorize_url).query)
         assert query["code_challenge_method"] == ["S256"]

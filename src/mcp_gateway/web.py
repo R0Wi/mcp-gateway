@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from urllib.parse import quote
 
 import anyio
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -47,6 +48,15 @@ def _require_session(request: Request) -> str:
 
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+def _error_message(exc: Exception) -> str:
+    # Some exceptions (bare TimeoutError() in particular) carry no message of
+    # their own -- str(exc) is "" -- which is how a prior version of this
+    # handler produced a banner that just said "Could not start
+    # authorization: " with nothing after the colon. Fall back to the
+    # exception's type name so there's always something to show.
+    return str(exc) or type(exc).__name__
 
 
 def build_auth_router() -> APIRouter:
@@ -146,9 +156,13 @@ def build_oauth_router() -> APIRouter:
 
     @router.get("/oauth/connect/{name}")
     async def connect(name: str, request: Request):
+        # JSON, not a redirect: the frontend fetches this and only navigates
+        # the browser to authorize_url on success, so a failure to even start
+        # the flow (e.g. a timeout reaching the backend) can show a dismissible
+        # toast in place instead of round-tripping through /ui/backends?error=.
         user = _session_user(request)
         if user is None:
-            return RedirectResponse(f"/ui/backends?login_next=connect:{name}")
+            raise HTTPException(status_code=401, detail="Sign in required to connect a backend")
         state = get_state(request)
         manager = state.backend_manager
         clients = state.backend_clients
@@ -159,8 +173,11 @@ def build_oauth_router() -> APIRouter:
             authorize_url = await manager.start_connect(name, clients[name])
         except Exception as exc:
             logger.exception("Connect flow for backend %s failed to start", name)
-            return RedirectResponse(f"/ui/backends?error=Could+not+start+authorization:+{exc}")
-        return RedirectResponse(authorize_url)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not start authorization: {_error_message(exc)}",
+            ) from exc
+        return {"authorize_url": authorize_url}
 
     @router.get("/oauth/callback")
     async def oauth_callback(request: Request):
@@ -176,7 +193,7 @@ def build_oauth_router() -> APIRouter:
         error = params.get("error")
         if error:
             desc = params.get("error_description") or error
-            return RedirectResponse(f"/ui/backends?error={desc}")
+            return RedirectResponse(f"/ui/backends?error={quote(desc)}")
         code, state = params.get("code"), params.get("state")
         if not code:
             raise HTTPException(status_code=400, detail="Missing authorization code")
@@ -186,8 +203,8 @@ def build_oauth_router() -> APIRouter:
             return RedirectResponse("/ui/backends?error=No+matching+authorization+flow")
         result = await manager.wait_connect_result(backend)
         if result:
-            return RedirectResponse(f"/ui/backends?error={result}")
-        return RedirectResponse(f"/ui/backends?connected={backend}")
+            return RedirectResponse(f"/ui/backends?error={quote(result)}")
+        return RedirectResponse(f"/ui/backends?connected={quote(backend)}")
 
     return router
 
