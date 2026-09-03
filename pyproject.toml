@@ -13,6 +13,8 @@ dependencies = [
     "cryptography>=50.0.0",
     "bcrypt>=5.0.0",
     "itsdangerous>=2.2.0",
+    # ID-token verification for the optional OIDC browser login (oidc.py).
+    "pyjwt[crypto]>=2.10.1",
     "httpx>=0.28.1",
     "alembic>=1.19.1",
     "sqlalchemy>=2.0.52",

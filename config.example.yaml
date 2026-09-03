@@ -33,11 +33,47 @@ auth:
 
   # Local users allowed to approve OAuth authorization requests.
   # Generate a hash with: mcp-gateway hash-password
+  #
+  # May be left empty (users: []) when `oidc` below is configured -- the login
+  # form is then replaced by the SSO button entirely. Configure at least one of
+  # the two, or the gateway refuses to start.
   users:
     - username: admin
       password_hash: "$2b$12$REPLACE_ME_WITH_A_REAL_BCRYPT_HASH"
       # For quick local testing you may use a plaintext password instead:
       # password: change-me
+
+  # Optional: log in through an external OpenID Connect provider (Pocket ID,
+  # Authentik, Keycloak, Entra ID, Auth0, ...) instead of -- or alongside --
+  # the local users above. The browser is redirected to the provider and the
+  # identity it returns becomes the gateway session's user; that session is
+  # what approves MCP clients on the consent screen.
+  #
+  # Register the gateway as a confidential OAuth client at the provider with
+  # the callback URL <public_url>/auth/oidc/callback.
+  #
+  # This is the *client-facing* login only; it is unrelated to
+  # `backends.*.auth.type: oauth`, which is how the gateway authenticates
+  # itself against upstream MCP servers.
+  # oidc:
+  #   issuer: https://id.example.com
+  #   client_id: ${OIDC_CLIENT_ID}
+  #   client_secret: ${OIDC_CLIENT_SECRET}   # omit for a public (PKCE-only) client
+  #   scopes: ["openid", "profile", "email", "groups"]
+  #   display_name: Pocket ID               # shown as "Continue with ..."
+  #   # Claim used as the gateway username (falls back to "sub"):
+  #   username_claim: preferred_username
+  #   # Optional allow-lists. Without either, anyone the provider
+  #   # authenticates for this client may log in.
+  #   # allowed_groups: ["mcp-admins"]
+  #   groups_claim: groups
+  #   # allowed_users: ["alice"]
+  #   # Endpoint overrides for providers without a discovery document
+  #   # (all three required; discovery is then skipped):
+  #   # authorization_endpoint: https://id.example.com/authorize
+  #   # token_endpoint: https://id.example.com/token
+  #   # jwks_uri: https://id.example.com/.well-known/jwks.json
+  #   # enabled: false                      # keep the config, turn it off
 
   # Lifetimes (seconds)
   access_token_expiry_seconds: 3600

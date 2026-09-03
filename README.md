@@ -48,7 +48,9 @@ building from source is only needed if you want to change the code.
   authorization codes — all stored **hashed**; client records encrypted at rest
 - Loopback redirect URIs match **port-agnostically** (Claude Code CLI registers one
   port and authorizes with another); non-loopback URIs require exact registration
-- Small **Svelte 5** login + consent UI (single local identity from the config file)
+- Small **Svelte 5** login + consent UI — local users from the config file, an
+  external **OpenID Connect provider** (Pocket ID, Authentik, Keycloak, Entra ID, …),
+  or both side by side
 
 **Backend-facing:**
 
@@ -132,6 +134,10 @@ auth:
   users:
     - username: admin
       password_hash: "$2b$12$…"          # mcp-gateway hash-password
+  oidc:                                  # optional; see "Logging in with an IdP"
+    issuer: https://id.example.com
+    client_id: ${OIDC_CLIENT_ID}
+    client_secret: ${OIDC_CLIENT_SECRET}
   access_token_expiry_seconds: 3600
   refresh_token_expiry_seconds: 2592000
 
@@ -156,6 +162,62 @@ backends:
 ```
 
 Adding a backend is config-only — no code changes.
+
+### Logging in with an identity provider (OIDC)
+
+By default the consent screen is guarded by the local users in `auth.users`. Set
+`auth.oidc` to have the browser log in through an external OpenID Connect provider
+instead — the identity it returns becomes the gateway session's user, and that
+session is what approves MCP clients.
+
+This is the **client-facing** login only. It is unrelated to
+`backends.*.auth.type: oauth`, which is how the gateway authenticates *itself*
+against upstream MCP servers; the two legs never share credentials or storage.
+
+```yaml
+auth:
+  users: []                                # optional: no local login at all
+  oidc:
+    issuer: https://id.example.com         # endpoints come from its discovery document
+    client_id: ${OIDC_CLIENT_ID}
+    client_secret: ${OIDC_CLIENT_SECRET}   # omit for a public (PKCE-only) client
+    scopes: ["openid", "profile", "email", "groups"]
+    display_name: Pocket ID                # button label: "Continue with Pocket ID"
+    username_claim: preferred_username     # falls back to "sub"
+    allowed_groups: ["mcp-admins"]         # optional allow-list (groups_claim: groups)
+    # allowed_users: ["alice"]
+```
+
+Register the gateway at your provider as an OAuth client whose callback URL is
+`<public_url>/auth/oidc/callback`, and enable PKCE if the provider makes it optional.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `issuer` | – | Endpoints are discovered from `<issuer>/.well-known/openid-configuration` |
+| `client_id` / `client_secret` | – | Secret optional; without it the gateway is a public client (PKCE only) |
+| `scopes` | `["openid", "profile", "email"]` | `openid` is added if you leave it out |
+| `username_claim` | `preferred_username` | Claim used as the gateway username |
+| `groups_claim` | `groups` | Claim read for `allowed_groups` |
+| `allowed_users` / `allowed_groups` | unset | Allow-lists; with neither, anyone the provider authenticates for this client may log in |
+| `display_name` | `SSO` | Sign-in button label |
+| `enabled` | `true` | Set `false` to keep the config but turn the provider off |
+| `authorization_endpoint`, `token_endpoint`, `jwks_uri` | unset | Set all three to skip discovery |
+
+Leaving `auth.users` empty removes the password form entirely, so the provider is the
+only way in; keeping both configured shows the password form *and* a
+"Continue with …" button. Configure at least one of the two — a config with neither is
+rejected at startup.
+
+What the gateway trusts is the **ID token**, and only after verifying it: the
+signature against the provider's JWKS (asymmetric algorithms only — `HS*` and `none`
+are refused whatever the provider advertises), `iss`, `aud`, `exp`, and the `nonce`
+bound to that browser's login. The access token the provider issues alongside it is
+never used or stored — the gateway wants an identity, not API access. The PKCE
+verifier and nonce ride along in a short-lived signed, HttpOnly cookie, which also
+makes the `state` check per-browser.
+
+Both routes (`/auth/oidc/login`, `/auth/oidc/callback`) return 404 when `auth.oidc`
+is unset, so a gateway without a provider exposes no extra surface.
 
 ### Backend auth reference
 
@@ -278,6 +340,7 @@ mcp-gateway run -c config.yaml --log-level debug
 | `/.well-known/oauth-authorization-server`     | RFC 8414 AS metadata (+ OIDC alias)            |
 | `/authorize`, `/token`, `/register`, `/revoke`| OAuth 2.1 endpoints (PKCE, DCR, revocation)    |
 | `/ui/authorize`                               | login + consent (Svelte 5)                     |
+| `/auth/oidc/login`, `/auth/oidc/callback`     | identity-provider login (404 unless `auth.oidc` is set) |
 | `/ui/backends`                                | backend connection status / connect / disconnect |
 | `/oauth/client-metadata.json`                 | the gateway's own CIMD document (upstream leg) |
 | `/oauth/connect/<backend>`, `/oauth/callback` | upstream OAuth connect flow                    |
@@ -318,6 +381,7 @@ misdirected backup, a shared volume snapshot, a support bundle.
 - Tokens issued to MCP clients are never forwarded to backends, and backend
   credentials never reach MCP clients.
 - Sessions are `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS.
+- OIDC logins verify the ID token's signature against the provider's JWKS (asymmetric algorithms only), plus `iss`, `aud`, `exp` and a per-browser `nonce`; the discovery document's issuer must match the configured one, and post-login redirects are restricted to paths on the gateway.
 - Login and Dynamic Client Registration (`/register`) are rate-limited per source IP;
   password checks run off the event loop so a flood of attempts can't stall the server.
 - Anonymous DCR/CIMD client registrations that never complete an authorization are
