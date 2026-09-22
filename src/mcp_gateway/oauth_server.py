@@ -6,6 +6,8 @@ Implements the MCP authorization spec (2025-11-25) for the client leg:
 - Dynamic Client Registration (RFC 7591) at /register
 - Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document)
   for URL-based client IDs, including private_key_jwt client authentication
+- Pre-registered ("static") confidential clients from config, for MCP clients
+  that support neither DCR nor CIMD (client_secret_basic / client_secret_post)
 - Authorization Server Metadata (RFC 8414) with
   ``client_id_metadata_document_supported: true``
 - Protected Resource Metadata (RFC 9728) and 401 challenges with
@@ -20,10 +22,14 @@ JSON API in ``web.py`` and finally calls :meth:`GatewayOAuthProvider.complete_au
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 import logging
 import secrets
 import time
 from typing import Any
+from urllib.parse import parse_qsl, unquote, urlencode
 
 from fastmcp.server.auth.auth import (
     AccessToken as FastMCPAccessToken,
@@ -36,19 +42,29 @@ from fastmcp.server.auth.auth import (
 from fastmcp.server.auth.cimd import CIMDClientManager
 from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
 from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.middleware.client_auth import AuthenticationError
 from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
     AuthorizeError,
     RefreshToken,
+    RegistrationError,
     TokenError,
     construct_redirect_uri,
 )
 from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
+from mcp.server.streamable_http import MCP_PROTOCOL_VERSION_HEADER
+from mcp.server.transport_security import (
+    DEFAULT_MAX_REQUEST_BODY_SIZE,
+    RequestBodyLimitMiddleware,
+)
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl
-from starlette.routing import Route
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.routing import Route, request_response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mcp_gateway.config import GatewayConfig
 from mcp_gateway.storage import Storage
@@ -76,6 +92,106 @@ class GatewayClient(ProxyDCRClient):
         return requested_scope.split(" ")
 
 
+def _basic_credentials(request: Request) -> tuple[str, str] | None:
+    """Decode an RFC 6749 §2.3.1 ``Authorization: Basic`` header, if present."""
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Basic "):
+        return None
+    try:
+        decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None
+    if ":" not in decoded:
+        return None
+    client_id, client_secret = decoded.split(":", 1)
+    return unquote(client_id), unquote(client_secret)
+
+
+class GatewayClientAuthenticator(PrivateKeyJWTClientAuthenticator):
+    """Token endpoint client authentication.
+
+    Static (config-defined) clients are authenticated here, accepting the
+    secret via either ``client_secret_basic`` or ``client_secret_post``
+    (clients like Gemini Enterprise don't let the operator pick). Everything
+    else -- DCR, CIMD, private_key_jwt -- is delegated unchanged.
+    """
+
+    def __init__(self, provider: GatewayOAuthProvider, **kwargs: Any):
+        super().__init__(provider, **kwargs)
+        self._gateway_provider = provider
+
+    async def authenticate_request(self, request: Request) -> OAuthClientInformationFull:
+        form_data = await request.form()
+        form_client_id = form_data.get("client_id")
+        basic = _basic_credentials(request)
+        client_id = form_client_id or (basic[0] if basic else None)
+        static = (
+            self._gateway_provider.get_static_client(str(client_id)) if client_id else None
+        )
+        if static is None:
+            return await super().authenticate_request(request)
+
+        if basic is not None and basic[0] != client_id:
+            raise AuthenticationError("Client ID mismatch in Basic auth")
+        presented = basic[1] if basic is not None else form_data.get("client_secret")
+        if not isinstance(presented, str) or not presented:
+            raise AuthenticationError("Client secret is required")
+        assert static.client_secret is not None
+        if not hmac.compare_digest(static.client_secret.encode(), presented.encode()):
+            logger.warning("Invalid client secret presented for static client %s", client_id)
+            raise AuthenticationError("Invalid client_secret")
+        return static
+
+
+def _basic_client_id_shim(app: ASGIApp) -> ASGIApp:
+    """Copy the client ID from an ``Authorization: Basic`` header into the form.
+
+    RFC 6749 §2.3.1 clients using HTTP Basic often omit ``client_id`` from the
+    body, but the SDK's token request models require it. Only urlencoded
+    bodies lacking ``client_id`` are rewritten; everything else passes through.
+    """
+
+    async def shim(scope: Scope, receive: Receive, send: Send) -> None:
+        request = Request(scope)
+        basic = _basic_credentials(request)
+        content_type = request.headers.get("content-type", "")
+        if (
+            scope["type"] != "http"
+            or basic is None
+            or not content_type.startswith("application/x-www-form-urlencoded")
+        ):
+            await app(scope, receive, send)
+            return
+
+        body = b""
+        more = True
+        while more:
+            message = await receive()
+            body += message.get("body", b"")
+            more = message.get("more_body", False)
+        fields = parse_qsl(body.decode("latin-1"), keep_blank_values=True)
+        if not any(key == "client_id" for key, _ in fields):
+            body = urlencode([*fields, ("client_id", basic[0])]).encode()
+            headers = [
+                (k, v) for k, v in scope["headers"] if k.lower() != b"content-length"
+            ]
+            headers.append((b"content-length", str(len(body)).encode()))
+            scope = {**scope, "headers": headers}
+
+        sent = False
+
+        async def replay() -> Message:
+            nonlocal sent
+            if sent:
+                return await receive()
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await app(scope, replay, send)
+
+    return shim
+
+
 class GatewayOAuthProvider(OAuthProvider):
     """A minimal, self-contained OAuth AS backed by SQLite and config-file users."""
 
@@ -100,13 +216,44 @@ class GatewayOAuthProvider(OAuthProvider):
             default_scope=" ".join(config.auth.scopes_supported),
             allowed_redirect_uri_patterns=self._allowed_redirect_patterns,
         )
+        default_scope = " ".join(config.auth.scopes_supported)
+        self._static_clients: dict[str, GatewayClient] = {
+            c.client_id: GatewayClient(
+                client_id=c.client_id,
+                client_secret=c.client_secret,
+                client_name=c.client_name or c.client_id,
+                redirect_uris=[AnyUrl(uri) for uri in c.redirect_uris],
+                token_endpoint_auth_method="client_secret_post",
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+                scope=" ".join(c.scopes) if c.scopes else default_scope or None,
+                # Exact match against redirect_uris; the DCR/CIMD allow-list
+                # patterns don't apply to operator-defined clients.
+                allowed_redirect_uri_patterns=None,
+            )
+            for c in config.auth.static_clients
+        }
+        if self._static_clients:
+            logger.info(
+                "Configured %d static OAuth client(s): %s",
+                len(self._static_clients),
+                ", ".join(self._static_clients),
+            )
 
     # ------------------------------------------------------------------ clients
+
+    def get_static_client(self, client_id: str) -> GatewayClient | None:
+        return self._static_clients.get(client_id)
 
     def _client_from_record(self, record: dict[str, Any]) -> GatewayClient:
         return GatewayClient.model_validate(record)
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        static = self._static_clients.get(client_id)
+        if static is not None:
+            logger.debug("Resolved static client %s from config", client_id)
+            return static
+
         record = self.storage.get_client(client_id)
         if record is not None:
             client = self._client_from_record(record)
@@ -139,6 +286,12 @@ class GatewayOAuthProvider(OAuthProvider):
         return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        if client_info.client_id in self._static_clients:
+            # DCR client IDs are random UUIDs, so this should never happen.
+            raise RegistrationError(
+                error="invalid_client_metadata",
+                error_description="client_id collides with a pre-registered client",
+            )
         client = GatewayClient.model_validate(client_info.model_dump(mode="json"))
         client.allowed_redirect_uri_patterns = self._allowed_redirect_patterns
         self.storage.save_client(client.client_id, client.model_dump(mode="json"))
@@ -383,7 +536,7 @@ class GatewayOAuthProvider(OAuthProvider):
                 and route.methods is not None
                 and "POST" in route.methods
             ):
-                authenticator = PrivateKeyJWTClientAuthenticator(
+                authenticator = GatewayClientAuthenticator(
                     provider=self,
                     cimd_manager=self.cimd_manager,
                     token_endpoint_url=token_endpoint_url,
@@ -392,7 +545,17 @@ class GatewayOAuthProvider(OAuthProvider):
                 patched.append(
                     Route(
                         path="/token",
-                        endpoint=cors_middleware(handler.handle, ["POST", "OPTIONS"]),
+                        # Same layering as the SDK's own /token route (CORS ->
+                        # body limit -> handler), plus the Basic client_id shim.
+                        endpoint=CORSMiddleware(
+                            app=RequestBodyLimitMiddleware(
+                                _basic_client_id_shim(request_response(handler.handle)),
+                                DEFAULT_MAX_REQUEST_BODY_SIZE,
+                            ),
+                            allow_origins="*",
+                            allow_methods=["POST", "OPTIONS"],
+                            allow_headers=[MCP_PROTOCOL_VERSION_HEADER],
+                        ),
                         methods=["POST", "OPTIONS"],
                     )
                 )

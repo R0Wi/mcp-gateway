@@ -81,6 +81,45 @@ class ServerConfig(BaseModel):
         return v.rstrip("/")
 
 
+class StaticClientConfig(BaseModel):
+    """A pre-registered (confidential) MCP client for clients that support
+    neither Dynamic Client Registration nor CIMD (e.g. Gemini Enterprise),
+    and only accept a fixed client ID/secret plus authorization/token URLs.
+
+    Served straight from config: never stored in the database, so it is not
+    subject to the unused-client TTL and is unaffected by ``rotate-key``.
+    """
+
+    client_id: str
+    client_secret: str
+    # Shown on the consent screen.
+    client_name: str | None = None
+    # Exact-match redirect URIs (the global allowed_client_redirect_uris
+    # patterns for DCR/CIMD clients do not apply here).
+    redirect_uris: list[str] = Field(min_length=1)
+    # Defaults to auth.scopes_supported.
+    scopes: list[str] | None = None
+
+    @field_validator("client_id")
+    @classmethod
+    def _check_client_id(cls, v: str) -> str:
+        if not v:
+            raise ValueError("static client 'client_id' must not be empty")
+        if v.lower().startswith(("http://", "https://")):
+            raise ValueError(
+                f"static client_id {v!r} must not be a URL (URL client IDs are "
+                "reserved for Client ID Metadata Documents)"
+            )
+        return v
+
+    @field_validator("client_secret")
+    @classmethod
+    def _check_client_secret(cls, v: str) -> str:
+        if not v:
+            raise ValueError("static client 'client_secret' must not be empty")
+        return v
+
+
 class AuthConfig(BaseModel):
     users: list[UserConfig]
     # Fernet key (or arbitrary passphrase, which is stretched via scrypt) used to
@@ -113,6 +152,18 @@ class AuthConfig(BaseModel):
     # Scopes advertised to MCP clients. The gateway is a single-identity AS, so
     # scopes are informational; "mcp" is the default catch-all.
     scopes_supported: list[str] = Field(default_factory=lambda: ["mcp"])
+    # Pre-registered clients for MCP clients that can't use DCR or CIMD.
+    static_clients: list[StaticClientConfig] = Field(default_factory=list)
+
+    @field_validator("static_clients")
+    @classmethod
+    def _check_static_clients(cls, v: list[StaticClientConfig]) -> list[StaticClientConfig]:
+        seen: set[str] = set()
+        for client in v:
+            if client.client_id in seen:
+                raise ValueError(f"Duplicate static client_id {client.client_id!r}")
+            seen.add(client.client_id)
+        return v
 
 
 class BackendAuthConfig(BaseModel):

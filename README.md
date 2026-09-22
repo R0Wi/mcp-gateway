@@ -40,6 +40,8 @@ building from source is only needed if you want to change the code.
 - **Client ID Metadata Documents (CIMD)** — HTTPS URLs as client IDs, including
   `private_key_jwt` client authentication, advertised via
   `client_id_metadata_document_supported: true`
+- **Pre-registered (static) clients** from config for MCP clients that can do neither
+  DCR nor CIMD (e.g. Gemini Enterprise) — `client_secret_basic` / `client_secret_post`
 - **Authorization Server Metadata** (RFC 8414) + OIDC discovery alias
 - **Protected Resource Metadata** (RFC 9728); 401 responses carry
   `WWW-Authenticate: Bearer resource_metadata="…"` as Claude's connector requires
@@ -111,6 +113,37 @@ uses its CIMD client ID), and opens your browser: log in with a user from
 
 Add `https://mcp.example.com/mcp` as a custom connector. The browser redirect to
 `https://claude.ai/api/mcp/auth_callback` goes through the same login/consent flow.
+
+### Connect clients without DCR/CIMD (e.g. Gemini Enterprise)
+
+Some MCP clients can't register themselves and only accept a fixed *Authorization URL*,
+*Token URL*, *Client ID* and *Client Secret*. Declare them under `auth.static_clients`:
+
+```yaml
+auth:
+  static_clients:
+    - client_id: gemini-enterprise
+      client_secret: ${GEMINI_CLIENT_SECRET}   # e.g. openssl rand -base64 32
+      client_name: Gemini Enterprise           # shown on the consent screen
+      redirect_uris:                           # exact match, required
+        - "https://vertexaisearch.cloud.google.com/oauth-redirect"
+```
+
+Then enter in the client:
+
+| Field             | Value                              |
+| ----------------- | ---------------------------------- |
+| Authorization URL | `https://mcp.example.com/authorize` |
+| Token URL         | `https://mcp.example.com/token`     |
+| Client ID / Secret| as configured above                |
+
+Use the redirect/callback URL your client documents. If it doesn't match, `/authorize`
+rejects the request with `Redirect URI '…' not registered for client`, which names the
+URI the client actually sent. The secret is accepted via HTTP Basic (`client_id` may be
+omitted from the body) or `client_secret` in the form body. PKCE (S256) is still
+mandatory. Static clients live only in the config file: they are never written to the
+database, are not reclaimed by the unused-client TTL, and are unaffected by `rotate-key`.
+Users still log in and approve on the consent screen as usual.
 
 ### Connect OAuth backends
 
@@ -312,6 +345,8 @@ misdirected backup, a shared volume snapshot, a support bundle.
 ### Hardening measures
 
 - PKCE (S256) is mandatory; authorization codes are single-use and expire in 5 min.
+- Static client secrets are compared in constant time; static client IDs can't be URLs,
+  so they never shadow CIMD client IDs.
 - Refresh tokens rotate on every use (OAuth 2.1 public-client requirement).
 - The consent screen names the client and the exact redirect target, and warns on
   loopback redirects (CIMD localhost-impersonation guidance from the spec).
