@@ -145,6 +145,45 @@ class BackendAuthConfig(BaseModel):
         return self
 
 
+PassthroughMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
+
+
+class PassthroughRoute(BaseModel):
+    """A raw-HTTP route on the backend exposed at ``/backends/<name><path>``.
+
+    ``path`` is an allowlisted prefix on segment boundaries: ``/uploads``
+    matches ``/uploads`` and ``/uploads/<id>`` but not ``/uploadsX``. It is
+    resolved against the *origin* of the backend's ``url``.
+    """
+
+    path: str
+    methods: list[PassthroughMethod] = Field(default_factory=lambda: ["POST"])
+    # Gateway-side cap, independent of whatever the backend itself enforces.
+    max_body_bytes: int = Field(default=100 * 1024 * 1024, gt=0)
+    timeout_seconds: float = Field(default=300.0, gt=0)
+
+    @field_validator("methods", mode="before")
+    @classmethod
+    def _upper_methods(cls, v: object) -> object:
+        if isinstance(v, list):
+            return list(dict.fromkeys(str(m).upper() for m in v))
+        return v
+
+    @field_validator("path")
+    @classmethod
+    def _check_path(cls, v: str) -> str:
+        if not v.startswith("/"):
+            raise ValueError(f"passthrough path {v!r} must start with '/'")
+        v = v.rstrip("/")
+        segments = v.split("/")[1:]
+        if not segments or any(s in ("", ".", "..") or "%" in s for s in segments):
+            raise ValueError(
+                f"passthrough path {v or '/'!r} must be a non-root path without "
+                "empty, '.', '..' or percent-encoded segments"
+            )
+        return v
+
+
 class BackendConfig(BaseModel):
     """An upstream MCP server exposed through the gateway."""
 
@@ -153,6 +192,17 @@ class BackendConfig(BaseModel):
     auth: BackendAuthConfig = Field(default_factory=BackendAuthConfig)
     # Extra static headers sent with every request regardless of auth type.
     headers: dict[str, str] = Field(default_factory=dict)
+    # Opt-in raw-HTTP routes (e.g. large uploads) proxied outside of MCP.
+    passthrough: list[PassthroughRoute] = Field(default_factory=list)
+
+    @field_validator("passthrough")
+    @classmethod
+    def _unique_paths(cls, v: list[PassthroughRoute]) -> list[PassthroughRoute]:
+        paths = [route.path for route in v]
+        dupes = sorted({p for p in paths if paths.count(p) > 1})
+        if dupes:
+            raise ValueError(f"duplicate passthrough path(s): {', '.join(dupes)}")
+        return v
 
 
 class StorageConfig(BaseModel):

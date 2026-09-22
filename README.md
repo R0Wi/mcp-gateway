@@ -173,6 +173,47 @@ falls back to Dynamic Client Registration. If the upstream AS supports neither (
 GitHub's), set `client_id` (and `client_secret`, if the app is confidential) to use a
 pre-registered OAuth client instead — CIMD/DCR are skipped entirely.
 
+### HTTP passthrough (large uploads)
+
+Everything an MCP client sends a backend normally goes through a tool call, and tool
+arguments pass through the calling model's context window. That's fine for JSON but
+not for a multi-MB file. For payloads like that, a backend can make specific raw-HTTP
+routes available through the gateway. This is off by default:
+
+```yaml
+backends:
+  wireshark:
+    url: https://wireshark-mcp.internal/mcp
+    auth: { type: bearer, token: "${WIRESHARK_MCP_TOKEN}" }
+    passthrough:
+      - path: /uploads              # allowlisted prefix: /uploads and /uploads/<id>
+        methods: [POST, DELETE]     # default: [POST]
+        max_body_bytes: 209715200   # gateway-side cap; default 100 MiB
+        timeout_seconds: 300        # default 300
+```
+
+| aspect   | behaviour                                                                                       |
+| -------- | ----------------------------------------------------------------------------------------------- |
+| route    | `<public_url>/backends/<name><path>` → `<origin of backend url><path>`, query string kept as-is |
+| paths    | exact prefix on segment boundaries (`/uploadsX` doesn't match); `.`/`..`, empty segments and encoded `/` are rejected; anything unlisted, or on a backend without `passthrough` or disabled → 404, wrong method → 405 |
+| auth     | the same bearer-token check as `/mcp` (same 401 + `WWW-Authenticate` challenge)                 |
+| upstream | the backend's own configured credential (`bearer`/`headers`/`oauth`, plus its static `headers`); an `oauth` backend's token is refreshed if needed, and a backend that isn't connected returns 503 — no interactive flow is ever started |
+| headers  | allowlisted both ways. To the backend: `Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Disposition`, `Accept`. Back to the client: `Content-Type`, `Content-Length`, `Content-Disposition`, `Content-Encoding`, `Cache-Control`, `ETag`, `Last-Modified`. The client's `Authorization`, cookies and `X-Forwarded-*` never reach the backend; `Location`/`Set-Cookie` never come back |
+| body     | streamed both ways, never buffered in full. A declared `Content-Length` over `max_body_bytes` → 413 before the backend is contacted; a chunked body that goes over the cap is cut off → 413 |
+| errors   | backend 2xx–4xx relayed as-is (its own API contract); backend 5xx and connection errors → generic 502, timeouts → 504, details in the server log only (the same approach as `mask_error_details` for MCP) |
+| logging  | one INFO line per request: backend, method, route, status, bytes in/out, duration                |
+
+```bash
+curl -H "Authorization: Bearer $GATEWAY_TOKEN" \
+     -H "Content-Type: application/vnd.tcpdump.pcap" \
+     --data-binary @capture.pcap \
+     https://mcp.example.com/backends/wireshark/uploads
+```
+
+The upstream `oauth` token is the one the gateway got for the backend's MCP URL. A
+backend that checks the token's resource/audience on its passthrough routes has to
+accept that token there too.
+
 ### Encryption key
 
 `auth.encryption_key` protects everything the gateway stores at rest: registered
@@ -281,6 +322,7 @@ mcp-gateway run -c config.yaml --log-level debug
 | `/ui/backends`                                | backend connection status / connect / disconnect |
 | `/oauth/client-metadata.json`                 | the gateway's own CIMD document (upstream leg) |
 | `/oauth/connect/<backend>`, `/oauth/callback` | upstream OAuth connect flow                    |
+| `/backends/<backend>/<path>`                  | opt-in raw-HTTP passthrough ([details](#http-passthrough-large-uploads)) |
 | `/healthz`                                    | liveness                                       |
 
 ## Security
@@ -316,7 +358,8 @@ misdirected backup, a shared volume snapshot, a support bundle.
 - The consent screen names the client and the exact redirect target, and warns on
   loopback redirects (CIMD localhost-impersonation guidance from the spec).
 - Tokens issued to MCP clients are never forwarded to backends, and backend
-  credentials never reach MCP clients.
+  credentials never reach MCP clients. The same holds for the opt-in HTTP
+  passthrough, which forwards only allowlisted headers.
 - Sessions are `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS.
 - Login and Dynamic Client Registration (`/register`) are rate-limited per source IP;
   password checks run off the event loop so a flood of attempts can't stall the server.

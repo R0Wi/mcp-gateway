@@ -74,6 +74,49 @@ def test_config_rejects_bad_backend_name():
         )
 
 
+def _config_with_passthrough(passthrough: list) -> GatewayConfig:
+    return GatewayConfig.model_validate(
+        {
+            "server": {"public_url": "https://x.example"},
+            "auth": {"encryption_key": "k", "users": [{"username": "a", "password": "p"}]},
+            "backends": {"b": {"url": "https://y.example/mcp", "passthrough": passthrough}},
+        }
+    )
+
+
+def test_config_passthrough_defaults_and_normalization():
+    assert GatewayConfig.model_validate(
+        {
+            "server": {"public_url": "https://x.example"},
+            "auth": {"encryption_key": "k", "users": [{"username": "a", "password": "p"}]},
+            "backends": {"b": {"url": "https://y.example/mcp"}},
+        }
+    ).backends["b"].passthrough == []
+    (route,) = _config_with_passthrough(
+        [{"path": "/uploads/", "methods": ["post", "delete", "POST"]}]
+    ).backends["b"].passthrough
+    assert route.path == "/uploads"
+    assert route.methods == ["POST", "DELETE"]
+    assert route.max_body_bytes == 100 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "path", ["uploads", "/", "//uploads", "/a/../b", "/a/./b", "/a%2Fb"]
+)
+def test_config_passthrough_rejects_bad_paths(path):
+    with pytest.raises(ValueError, match="passthrough path"):
+        _config_with_passthrough([{"path": path}])
+
+
+def test_config_passthrough_rejects_bad_values():
+    with pytest.raises(ValueError, match="duplicate passthrough"):
+        _config_with_passthrough([{"path": "/u"}, {"path": "/u/"}])
+    with pytest.raises(ValueError):
+        _config_with_passthrough([{"path": "/u", "methods": ["TRACE"]}])
+    with pytest.raises(ValueError):
+        _config_with_passthrough([{"path": "/u", "max_body_bytes": 0}])
+
+
 def test_storage_encrypts_secrets_at_rest(tmp_path):
     db_path = tmp_path / "test.db"
     storage = Storage(db_path, "passphrase")

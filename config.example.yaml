@@ -97,3 +97,19 @@ backends:
   #     type: headers
   #     headers:
   #       X-API-Key: ${INTERNAL_API_KEY}
+
+  # Opt-in raw-HTTP passthrough for payloads that don't fit in MCP tool
+  # arguments (e.g. multi-MB uploads). Each path is exposed at
+  # <public_url>/backends/<name><path> behind the same bearer-token check as
+  # /mcp and streamed to <backend origin><path> with this backend's own
+  # credential. Omit `passthrough` and no such route exists.
+  # wireshark:
+  #   url: https://wireshark-mcp.internal/mcp
+  #   auth:
+  #     type: bearer
+  #     token: ${WIRESHARK_MCP_TOKEN}
+  #   passthrough:
+  #     - path: /uploads              # also matches /uploads/<id>
+  #       methods: [POST, DELETE]     # default: [POST]
+  #       max_body_bytes: 209715200   # 200 MiB; default 100 MiB
+  #       timeout_seconds: 300        # default 300

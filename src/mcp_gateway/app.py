@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from mcp_gateway.config import GatewayConfig, load_config
 from mcp_gateway.gateway import build_gateway
 from mcp_gateway.oauth_server import GatewayOAuthProvider
+from mcp_gateway.passthrough import PASSTHROUGH_PREFIX, build_passthrough
 from mcp_gateway.ratelimit import RateLimiter
 from mcp_gateway.state import GatewayState
 from mcp_gateway.storage import Storage
@@ -80,6 +81,7 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
     # The MCP endpoint lives at <public_url>/mcp; auth + well-known routes sit
     # at the root of the same app per RFC 8414/9728.
     mcp_app = mcp.http_app(path="/mcp")
+    passthrough = build_passthrough(config, provider, manager)
 
     async def _purge_loop() -> None:
         while True:
@@ -100,6 +102,8 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
         purge_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await purge_task
+        if passthrough is not None:
+            await passthrough.aclose()
         logger.info("Shutting down: closing storage")
         storage.close()
 
@@ -173,6 +177,12 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
         from fastapi.responses import RedirectResponse
 
         return RedirectResponse("/ui/")
+
+    # Opt-in raw-HTTP routes to backends (see passthrough.py). Only mounted
+    # when some backend declares one; otherwise /backends/* falls through to
+    # the catch-all below and 404s like any other unknown path.
+    if passthrough is not None:
+        app.mount(PASSTHROUGH_PREFIX, passthrough.app)
 
     # Everything else (MCP endpoint, /authorize, /token, /register, /revoke,
     # /.well-known/*) is handled by the FastMCP app mounted as catch-all.
