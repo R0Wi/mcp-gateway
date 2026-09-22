@@ -117,6 +117,17 @@ uses its CIMD client ID), and opens your browser: log in with a user from
 Add `https://mcp.example.com/mcp` as a custom connector. The browser redirect to
 `https://claude.ai/api/mcp/auth_callback` goes through the same login/consent flow.
 
+### Clients behind session-dropping relays (stateless mode)
+
+Some relays don't carry the `Mcp-Session-Id` header through, so the second request of
+a session fails. One example is Microsoft Copilot Studio reaching an on-prem gateway through a Power
+Platform custom connector and on-premises data gateway. For these, set
+`server.stateless_http: true` (or `MCP_GATEWAY_STATELESS_HTTP=true` with the example
+config). `/mcp` then issues no session ID and handles every request on its own. OAuth
+is unaffected, because each request still carries its bearer token. In this mode the gateway can't
+send requests to the client (sampling, elicitation) and doesn't support the standalone GET
+notification stream. Backend connections work the same either way.
+
 ### Connect OAuth backends
 
 Open `https://mcp.example.com/ui/backends`, sign in, and press **Connect** next to each

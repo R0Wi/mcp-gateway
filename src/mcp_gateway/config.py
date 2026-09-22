@@ -74,6 +74,14 @@ class ServerConfig(BaseModel):
     # bridge subnet, or "*" only if you fully trust the network path) when
     # the proxy connects from elsewhere.
     trusted_proxy_ips: str = "127.0.0.1"
+    # Serve the client-facing /mcp endpoint in stateless Streamable HTTP mode:
+    # no Mcp-Session-Id is issued or required, and every request gets a fresh
+    # MCP session. Needed behind relays that drop that header (e.g. Microsoft
+    # Copilot Studio via a Power Platform custom connector + on-premises data
+    # gateway). Server-initiated requests (sampling, elicitation) and
+    # standalone GET notification streams are unavailable in this mode.
+    # Only affects the client leg; backend connections are unchanged.
+    stateless_http: bool = False
 
     @field_validator("public_url")
     @classmethod
