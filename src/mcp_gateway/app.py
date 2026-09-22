@@ -13,7 +13,11 @@ from fastapi.responses import JSONResponse
 from mcp_gateway.config import GatewayConfig, load_config
 from mcp_gateway.gateway import build_gateway
 from mcp_gateway.oauth_server import GatewayOAuthProvider
-from mcp_gateway.passthrough import PASSTHROUGH_PREFIX, build_passthrough
+from mcp_gateway.passthrough import (
+    PASSTHROUGH_PREFIX,
+    build_passthrough,
+    install_ticket_log_redaction,
+)
 from mcp_gateway.ratelimit import RateLimiter
 from mcp_gateway.state import GatewayState
 from mcp_gateway.storage import Storage
@@ -82,6 +86,10 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
     # at the root of the same app per RFC 8414/9728.
     mcp_app = mcp.http_app(path="/mcp")
     passthrough = build_passthrough(config, provider, manager)
+    if passthrough is not None:
+        # Upload tickets are credentials embedded in the URL path; keep them
+        # out of uvicorn's access log.
+        install_ticket_log_redaction()
 
     async def _purge_loop() -> None:
         while True:

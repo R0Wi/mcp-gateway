@@ -106,6 +106,9 @@ class AuthConfig(BaseModel):
     refresh_token_expiry_seconds: int = 60 * 60 * 24 * 30
     authorization_code_expiry_seconds: int = 300
     login_session_expiry_seconds: int = 60 * 60 * 8
+    # Lifetime of the single-use upload URLs minted by gateway_create_upload_url
+    # (see the README's "HTTP passthrough" section).
+    upload_ticket_expiry_seconds: int = Field(default=300, gt=0)
     # Optional allow-list of redirect URI patterns for dynamically registered /
     # CIMD clients (e.g. "https://claude.ai/*"). When unset, standard validation
     # applies: exact match against registered URIs with loopback ports allowed to vary.
@@ -151,9 +154,8 @@ PassthroughMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
 class PassthroughRoute(BaseModel):
     """A raw-HTTP route on the backend exposed at ``/backends/<name><path>``.
 
-    ``path`` is an allowlisted prefix on segment boundaries: ``/uploads``
-    matches ``/uploads`` and ``/uploads/<id>`` but not ``/uploadsX``. It is
-    resolved against the *origin* of the backend's ``url``.
+    ``path`` is matched exactly (no prefixes) and resolved against the
+    backend's ``passthrough_base_url``, or else the *origin* of its ``url``.
     """
 
     path: str
@@ -181,6 +183,9 @@ class PassthroughRoute(BaseModel):
                 f"passthrough path {v or '/'!r} must be a non-root path without "
                 "empty, '.', '..' or percent-encoded segments"
             )
+        if segments[0] == "t":
+            # /backends/<name>/t/<ticket> is the presigned-upload route.
+            raise ValueError(f"passthrough path {v!r} must not start with the reserved '/t'")
         return v
 
 
@@ -194,6 +199,14 @@ class BackendConfig(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     # Opt-in raw-HTTP routes (e.g. large uploads) proxied outside of MCP.
     passthrough: list[PassthroughRoute] = Field(default_factory=list)
+    # Base URL passthrough paths are resolved against. Defaults to the origin
+    # of `url` (which is the MCP endpoint, e.g. https://host/mcp).
+    passthrough_base_url: str | None = None
+
+    @field_validator("passthrough_base_url")
+    @classmethod
+    def _normalize_base_url(cls, v: str | None) -> str | None:
+        return v.rstrip("/") if v else v
 
     @field_validator("passthrough")
     @classmethod

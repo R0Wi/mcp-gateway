@@ -108,6 +108,8 @@ Request flow, root to leaf:
   The raw-HTTP passthrough (`passthrough.py`) is a separate path with the same rule:
   request/response headers are allowlisted, and only the gateway's own backend credential
   (`BackendManager.upstream_auth_headers`) is attached.
+  Its presigned upload tickets (`gateway_create_upload_url`) are credentials in the URL
+  path: stored hashed, single use, and redacted from uvicorn's access log — never log them.
 - **Single-instance by design.** SQLite, in-memory connect flows, and in-memory rate
   limiting all assume one process. Don't introduce work that only makes sense across
   replicas without saying so.

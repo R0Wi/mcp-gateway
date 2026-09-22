@@ -100,8 +100,22 @@ def test_config_passthrough_defaults_and_normalization():
     assert route.max_body_bytes == 100 * 1024 * 1024
 
 
+def test_config_upload_ticket_and_base_url_settings():
+    config = GatewayConfig.model_validate(
+        {
+            "server": {"public_url": "https://x.example"},
+            "auth": {"encryption_key": "k", "users": [{"username": "a", "password": "p"}]},
+            "backends": {
+                "b": {"url": "https://y.example/mcp", "passthrough_base_url": "https://y.example/api/"}
+            },
+        }
+    )
+    assert config.auth.upload_ticket_expiry_seconds == 300
+    assert config.backends["b"].passthrough_base_url == "https://y.example/api"
+
+
 @pytest.mark.parametrize(
-    "path", ["uploads", "/", "//uploads", "/a/../b", "/a/./b", "/a%2Fb"]
+    "path", ["uploads", "/", "//uploads", "/a/../b", "/a/./b", "/a%2Fb", "/t", "/t/x"]
 )
 def test_config_passthrough_rejects_bad_paths(path):
     with pytest.raises(ValueError, match="passthrough path"):

@@ -4,25 +4,40 @@ MCP tool arguments travel through the calling model's context window, which
 makes them useless for multi-MB binaries. A backend can instead declare
 ``passthrough`` routes in the config; each is exposed at
 ``<public_url>/backends/<name><path>`` and streamed through to
-``<backend origin><path>``.
+``<backend base><path>`` (``passthrough_base_url``, else the origin of the
+backend's MCP ``url``).
+
+Model-driven clients (Claude Code, claude.ai connectors) never see the
+gateway's OAuth token -- it lives in the harness -- so they can't call a
+bearer-protected URL with ``curl``. For them the ``gateway_create_upload_url``
+MCP tool mints a presigned URL, ``<public_url>/backends/<name>/t/<ticket>``:
+the ticket is 128-bit random, single use, short-lived, bound to backend +
+path + method, and stored hashed. It sits in a fixed path segment (never the
+query string) so the access log can redact it; the caller's own query string
+(e.g. ``?filename=``) is forwarded.
 
 This is a separate code path from the MCP proxy in ``gateway.py`` and keeps
 the same guarantees:
 
 - Clients authenticate with the *same* bearer-token check as ``/mcp``
-  (the provider's own ``AuthenticationMiddleware`` + ``RequireAuthMiddleware``).
+  (the provider's own ``AuthenticationMiddleware`` + ``RequireAuthMiddleware``),
+  or with a ticket that was itself minted over authenticated MCP.
 - The backend only ever sees the gateway's own credential for it (static
   headers or its upstream OAuth token), never the client's token: request
   headers are forwarded from a short allowlist, not a denylist.
 - Bodies are streamed in both directions, never buffered, and capped per
   route on the gateway side.
-- Backend 5xx and transport errors are masked (the passthrough analogue of
-  ``mask_error_details=True``); details go to the server log only.
+- Backend 4xx bodies are relayed verbatim (they're actionable: too large,
+  not a capture, ...). Backend 5xx and transport errors are masked (the
+  passthrough analogue of ``mask_error_details=True``); details go to the
+  server log only. Tickets are never logged.
 """
 
 from __future__ import annotations
 
 import logging
+import re
+import secrets
 import time
 from collections.abc import AsyncIterator
 from urllib.parse import unquote, urlsplit
@@ -39,11 +54,13 @@ from starlette.types import Receive, Scope, Send
 
 from mcp_gateway.config import BackendConfig, GatewayConfig, PassthroughRoute
 from mcp_gateway.oauth_server import GatewayOAuthProvider
+from mcp_gateway.storage import Storage
 from mcp_gateway.upstream import BackendManager, NotConnectedError
 
 logger = logging.getLogger(__name__)
 
 PASSTHROUGH_PREFIX = "/backends"
+TICKET_SEGMENT = "t"
 
 # Client -> backend. Everything else (Authorization, Cookie, Host,
 # X-Forwarded-*, ...) is dropped; the backend's own credential is added by
@@ -76,24 +93,89 @@ def _error(status: int, error: str, description: str) -> Response:
     return JSONResponse({"error": error, "error_description": description}, status_code=status)
 
 
-def _backend_origin(url: str) -> str:
-    parts = urlsplit(url)
+def _target_base(backend: BackendConfig) -> str:
+    if backend.passthrough_base_url:
+        return backend.passthrough_base_url
+    parts = urlsplit(backend.url)
     return f"{parts.scheme}://{parts.netloc}"
 
 
 def _match_route(routes: list[PassthroughRoute], path: str) -> PassthroughRoute | None:
-    for route in routes:
-        if path == route.path or path.startswith(route.path + "/"):
-            return route
-    return None
+    """Exact match only: an explicit allowlist, no free prefixes."""
+    return next((route for route in routes if route.path == path), None)
+
+
+# ------------------------------------------------------------------ tickets
+
+
+class UploadTicketError(ValueError):
+    """The requested (backend, path, method) can't get an upload URL."""
+
+
+def create_upload_ticket(
+    config: GatewayConfig, storage: Storage, backend: str, path: str, method: str = "POST"
+) -> dict[str, object]:
+    """Mint a single-use presigned URL for a declared passthrough route."""
+    method = method.upper()
+    backend_config = config.backends.get(backend)
+    if backend_config is None or not backend_config.enabled:
+        raise UploadTicketError(f"Unknown or disabled backend {backend!r}")
+    route = _match_route(backend_config.passthrough, path.rstrip("/") or "/")
+    if route is None:
+        declared = ", ".join(r.path for r in backend_config.passthrough) or "none"
+        raise UploadTicketError(
+            f"Backend {backend!r} declares no passthrough path {path!r} (declared: {declared})"
+        )
+    if method not in route.methods:
+        raise UploadTicketError(
+            f"Method {method} is not allowed for {backend}{route.path} "
+            f"(allowed: {', '.join(route.methods)})"
+        )
+    ttl = config.auth.upload_ticket_expiry_seconds
+    ticket = secrets.token_urlsafe(16)  # 128 bits
+    storage.save_upload_ticket(
+        ticket, backend=backend, path=route.path, method=method, expires_at=time.time() + ttl
+    )
+    logger.info("Minted upload URL for %s %s%s (ttl=%ds)", method, backend, route.path, ttl)
+    return {
+        "url": f"{config.server.public_url}{PASSTHROUGH_PREFIX}/{backend}/{TICKET_SEGMENT}/{ticket}",
+        "method": method,
+        "max_body_bytes": route.max_body_bytes,
+        "expires_in_seconds": ttl,
+    }
+
+
+_TICKET_IN_PATH = re.compile(
+    rf"({re.escape(PASSTHROUGH_PREFIX)}/[^/\s?]+/{TICKET_SEGMENT}/)[^/\s?\"]+"
+)
+
+
+class RedactTicketFilter(logging.Filter):
+    """Redact upload tickets from log records (notably uvicorn's access log)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple) and record.args:
+            record.args = tuple(
+                _TICKET_IN_PATH.sub(r"\1[redacted]", a) if isinstance(a, str) else a
+                for a in record.args
+            )
+        if isinstance(record.msg, str):
+            record.msg = _TICKET_IN_PATH.sub(r"\1[redacted]", record.msg)
+        return True
+
+
+def install_ticket_log_redaction() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, RedactTicketFilter) for f in access_logger.filters):
+        access_logger.addFilter(RedactTicketFilter())
 
 
 def _split_raw_path(scope: Scope) -> tuple[str, str] | None:
     """Return ``(backend_name, raw_backend_path)`` or None if malformed.
 
     Works on the raw (still percent-encoded) request path so an encoded
-    ``/`` can't smuggle a ``..`` or an extra segment past the allowlist, and
-    so the path reaches the backend exactly as the client encoded it.
+    ``/`` can't smuggle a ``..`` or an extra segment past the allowlist. The
+    backend is always sent the configured ``route.path``, never this one.
     """
     raw = scope.get("raw_path") or scope["path"].encode()
     raw_path = raw.decode("latin-1").split("?", 1)[0]
@@ -124,6 +206,7 @@ class PassthroughProxy:
             if backend.enabled and backend.passthrough
         }
         self._manager = manager
+        self._storage = provider.storage
         self._http = httpx.AsyncClient(follow_redirects=False)
 
         resource_url = provider._get_resource_url("/mcp")
@@ -133,9 +216,15 @@ class PassthroughProxy:
         # Same auth stack FastMCP builds for /mcp (fastmcp/server/http.py):
         # the provider's middleware authenticates the bearer token, and
         # RequireAuthMiddleware turns "no/invalid token" into the same 401 +
-        # WWW-Authenticate challenge.
+        # WWW-Authenticate challenge. The ticket route comes first and isn't
+        # wrapped: the ticket itself is the credential.
         self.app = Starlette(
             routes=[
+                Route(
+                    f"/{{name}}/{TICKET_SEGMENT}/{{ticket}}",
+                    endpoint=self._proxy_ticket,
+                    methods=_ALL_METHODS,
+                ),
                 Route(
                     "/{rest:path}",
                     endpoint=RequireAuthMiddleware(
@@ -151,10 +240,10 @@ class PassthroughProxy:
         await self._http.aclose()
 
     async def _handle(self, scope: Scope, receive: Receive, send: Send) -> None:
-        response = await self._proxy(Request(scope, receive))
+        response = await self._proxy_bearer(Request(scope, receive))
         await response(scope, receive, send)
 
-    async def _proxy(self, request: Request) -> Response:
+    async def _proxy_bearer(self, request: Request) -> Response:
         split = _split_raw_path(request.scope)
         if split is None:
             return _error(404, "not_found", "No such passthrough route")
@@ -165,7 +254,29 @@ class PassthroughProxy:
             return _error(404, "not_found", "No such passthrough route")
         if request.method not in route.methods:
             return _error(405, "method_not_allowed", "Method not allowed for this route")
+        return await self._forward(request, name, backend, route)
 
+    async def _proxy_ticket(self, request: Request) -> Response:
+        name = request.path_params["name"]
+        ticket = request.path_params["ticket"]
+        info = self._storage.get_upload_ticket(ticket)
+        if info is None or info["backend"] != name:
+            return _error(401, "invalid_ticket", "Upload URL is invalid, expired or already used")
+        if request.method != info["method"]:
+            # Not consumed: a stray HEAD/GET mustn't burn the caller's URL.
+            return _error(405, "method_not_allowed", f"This upload URL only accepts {info['method']}")
+        backend = self._backends.get(name)
+        route = _match_route(backend.passthrough, info["path"]) if backend else None
+        if backend is None or route is None:
+            # Config changed since the ticket was minted.
+            return _error(404, "not_found", "No such passthrough route")
+        if not self._storage.consume_upload_ticket(ticket):
+            return _error(401, "invalid_ticket", "Upload URL is invalid, expired or already used")
+        return await self._forward(request, name, backend, route)
+
+    async def _forward(
+        self, request: Request, name: str, backend: BackendConfig, route: PassthroughRoute
+    ) -> Response:
         declared = request.headers.get("content-length")
         if declared is not None:
             try:
@@ -202,7 +313,7 @@ class PassthroughProxy:
         has_body = (declared is not None and declared != "0") or (
             "transfer-encoding" in request.headers
         )
-        url = _backend_origin(backend.url) + raw_path
+        url = _target_base(backend) + route.path
         if request.url.query:
             url += "?" + request.url.query
         upstream_request = self._http.build_request(

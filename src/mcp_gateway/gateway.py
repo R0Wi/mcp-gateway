@@ -15,11 +15,13 @@ import functools
 import logging
 
 from fastmcp import Client, FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.server import create_proxy
 from mcp.types import Icon, ToolAnnotations
 
 from mcp_gateway.config import GatewayConfig
 from mcp_gateway.oauth_server import GatewayOAuthProvider
+from mcp_gateway.passthrough import UploadTicketError, create_upload_ticket
 from mcp_gateway.upstream import BackendManager
 from mcp_gateway.web import STATIC_DIR
 
@@ -94,6 +96,35 @@ def build_gateway(
         """List the backends configured in this gateway and their connection state."""
         logger.debug("gateway_status tool invoked")
         return manager.backend_status()
+
+    passthrough_routes = {
+        name: [f"{'/'.join(r.methods)} {r.path}" for r in backend.passthrough]
+        for name, backend in config.backends.items()
+        if backend.enabled and backend.passthrough
+    }
+    if passthrough_routes:
+        routes_doc = "; ".join(f"{n}: {', '.join(r)}" for n, r in passthrough_routes.items())
+
+        @mcp.tool(
+            name="gateway_create_upload_url",
+            description=(
+                "Create a short-lived, single-use URL for uploading a large file "
+                "(e.g. a packet capture) directly to a backend over plain HTTP, so "
+                "the bytes never pass through tool arguments. Send the raw file "
+                "as the request body, e.g. "
+                "`curl --data-binary @file.pcap \"<url>?filename=file.pcap\"`, "
+                "then use whatever the backend returns (e.g. an upload handle) "
+                "in its MCP tools. Available routes: " + routes_doc
+            ),
+            annotations=ToolAnnotations(
+                title="Create Upload URL", readOnlyHint=False, openWorldHint=False
+            ),
+        )
+        def gateway_create_upload_url(backend: str, path: str, method: str = "POST") -> dict:
+            try:
+                return create_upload_ticket(config, provider.storage, backend, path, method)
+            except UploadTicketError as exc:
+                raise ToolError(str(exc)) from None
 
     for name, backend in config.backends.items():
         if not backend.enabled:
