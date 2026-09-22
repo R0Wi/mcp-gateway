@@ -77,7 +77,8 @@ Request flow, root to leaf:
   the FastMCP server, and mounts `mcp.http_app(path="/mcp")` **as a catch-all at `/`**.
   So `/mcp`, `/authorize`, `/token`, `/register`, `/revoke`, `/.well-known/*` are all
   served by the mounted FastMCP app; only `/auth/api/*`, `/oauth/*`, `/ui/*`, `/healthz`
-  are explicit FastAPI routes in `web.py`. If a route seems missing, it's in the mount.
+  are explicit FastAPI routes in `web.py`, plus `/backends/*` (`passthrough.py`, mounted
+  only when some backend declares `passthrough`). If a route seems missing, it's in the mount.
 - `gateway.py` mounts each backend as a live FastMCP proxy under its namespace, so
   backend `github`'s `create_issue` becomes `github_create_issue`. A down or
   not-yet-connected backend only removes its own tools.
@@ -104,6 +105,11 @@ Request flow, root to leaf:
   backend. `gateway.py` sets `transport.forward_incoming_headers = False` and *raises at
   startup* if that attribute is missing — a fastmcp upgrade that renames it must be
   handled, never worked around by deleting the check.
+  The raw-HTTP passthrough (`passthrough.py`) is a separate path with the same rule:
+  request/response headers are allowlisted, and only the gateway's own backend credential
+  (`BackendManager.upstream_auth_headers`) is attached.
+  Its presigned upload tickets (`gateway_create_upload_url`) are credentials in the URL
+  path: stored hashed, single use, and redacted from uvicorn's access log — never log them.
 - **Single-instance by design.** SQLite, in-memory connect flows, and in-memory rate
   limiting all assume one process. Don't introduce work that only makes sense across
   replicas without saying so.

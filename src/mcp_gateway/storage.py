@@ -339,6 +339,41 @@ class Storage:
             self._conn.execute("DELETE FROM auth_codes WHERE code_hash=?", (token_hash(code),))
             self._conn.commit()
 
+    # -- upload tickets (presigned passthrough URLs) ------------------------------
+
+    def save_upload_ticket(
+        self, ticket: str, *, backend: str, path: str, method: str, expires_at: float
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO upload_tickets(ticket_hash, backend, path, method, expires_at)"
+                " VALUES(?,?,?,?,?)",
+                (token_hash(ticket), backend, path, method, expires_at),
+            )
+            self._conn.commit()
+
+    def get_upload_ticket(self, ticket: str) -> dict[str, Any] | None:
+        """Look up an unexpired ticket without consuming it."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT backend, path, method, expires_at FROM upload_tickets"
+                " WHERE ticket_hash=?",
+                (token_hash(ticket),),
+            ).fetchone()
+        if row is None or row[3] < time.time():
+            return None
+        return {"backend": row[0], "path": row[1], "method": row[2], "expires_at": row[3]}
+
+    def consume_upload_ticket(self, ticket: str) -> bool:
+        """Atomically delete an unexpired ticket; True if this call consumed it."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM upload_tickets WHERE ticket_hash=? AND expires_at >= ?",
+                (token_hash(ticket), time.time()),
+            )
+            self._conn.commit()
+        return cur.rowcount == 1
+
     # -- access tokens ------------------------------------------------------------
 
     def save_access_token(
@@ -501,6 +536,8 @@ class Storage:
             cur = self._conn.execute("DELETE FROM refresh_tokens WHERE expires_at < ?", (now,))
             deleted += cur.rowcount
             cur = self._conn.execute("DELETE FROM auth_txns WHERE expires_at < ?", (now,))
+            deleted += cur.rowcount
+            cur = self._conn.execute("DELETE FROM upload_tickets WHERE expires_at < ?", (now,))
             deleted += cur.rowcount
             cur = self._conn.execute(
                 "DELETE FROM revoked_sessions WHERE expires_at < ?", (now,)

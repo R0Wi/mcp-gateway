@@ -43,6 +43,7 @@ auth:
   access_token_expiry_seconds: 3600
   refresh_token_expiry_seconds: 2592000   # 30 days
   login_session_expiry_seconds: 28800     # 8 hours
+  # upload_ticket_expiry_seconds: 300    # lifetime of gateway_create_upload_url URLs
 
   # Optional allow-list of redirect URI patterns for dynamically registered
   # clients. When omitted, clients may only use the redirect URIs they
@@ -97,3 +98,21 @@ backends:
   #     type: headers
   #     headers:
   #       X-API-Key: ${INTERNAL_API_KEY}
+
+  # Opt-in raw-HTTP passthrough for payloads that don't fit in MCP tool
+  # arguments (e.g. multi-MB uploads). Each path is exposed at
+  # <public_url>/backends/<name><path> (bearer token, same check as /mcp) and
+  # via single-use URLs minted by the gateway_create_upload_url MCP tool, and
+  # streamed to <passthrough_base_url or origin of url><path> with this
+  # backend's own credential. Omit `passthrough` and no such route exists.
+  # wireshark:
+  #   url: https://wireshark-mcp.internal/mcp
+  #   auth:
+  #     type: bearer
+  #     token: ${WIRESHARK_MCP_TOKEN}
+  #   # passthrough_base_url: https://wireshark-mcp.internal   # default: origin of url
+  #   passthrough:
+  #     - path: /uploads              # exact path, no prefixes
+  #       methods: [POST]             # default: [POST]
+  #       max_body_bytes: 209715200   # 200 MiB; default 100 MiB
+  #       timeout_seconds: 300        # default 300

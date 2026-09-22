@@ -22,6 +22,7 @@ _EXPECTED_TABLES = {
     "auth_txns",
     "upstream_data",
     "revoked_sessions",
+    "upload_tickets",
     "alembic_version",
 }
 
@@ -38,7 +39,7 @@ def test_fresh_database_gets_full_schema_and_head_revision(tmp_path):
         run_migrations(conn)
         assert _EXPECTED_TABLES <= _tables(conn)
         (head,) = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-        assert head == "0002"
+        assert head == "0003"
     finally:
         conn.close()
 

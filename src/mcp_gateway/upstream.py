@@ -254,16 +254,53 @@ class BackendManager:
 
     # ------------------------------------------------------------- client building
 
-    def build_client(self, name: str, backend: BackendConfig) -> Client:
+    @staticmethod
+    def static_headers(backend: BackendConfig) -> dict[str, str]:
+        """Static headers (incl. bearer/headers auth) sent with every backend request."""
         # Lowercase header names so they take precedence in any case-sensitive
         # merge with per-request headers further down the stack.
         headers = {k.lower(): v for k, v in backend.headers.items()}
-        auth: Any = None
         if backend.auth.type == "bearer":
             headers["authorization"] = f"Bearer {backend.auth.token}"
         elif backend.auth.type == "headers":
             headers.update({k.lower(): v for k, v in backend.auth.headers.items()})
-        elif backend.auth.type == "oauth":
+        return headers
+
+    async def upstream_auth_headers(self, name: str, backend: BackendConfig) -> dict[str, str]:
+        """Headers carrying the gateway's own credential for `backend`.
+
+        Used by the raw-HTTP passthrough, which can't hand the OAuth provider
+        to httpx as ``auth=``: the SDK's auth flow holds ``context.lock``
+        across the whole request, so a long upload would stall every MCP call
+        to that backend, and its 401 path would try to replay a streamed,
+        non-replayable body. Instead take the lock only long enough to load
+        (and if needed refresh) the stored token. Never starts an interactive
+        flow: no usable token raises ``NotConnectedError``.
+        """
+        headers = self.static_headers(backend)
+        if backend.auth.type != "oauth":
+            return headers
+        provider = self._build_oauth_provider(name, backend)
+        async with provider.context.lock:
+            if not provider._initialized:
+                await provider._initialize()
+            ctx = provider.context
+            if not ctx.is_token_valid() and ctx.can_refresh_token():
+                logger.debug("Backend %s: refreshing upstream token for passthrough", name)
+                refresh_request = await provider._refresh_token()
+                async with httpx.AsyncClient(timeout=30.0) as http:
+                    refresh_response = await http.send(refresh_request)
+                if not await provider._handle_refresh_response(refresh_response):
+                    provider._initialized = False
+            if ctx.current_tokens is None or not ctx.is_token_valid():
+                raise NotConnectedError(f"Backend '{name}' has no usable OAuth token")
+            headers["authorization"] = f"Bearer {ctx.current_tokens.access_token}"
+        return headers
+
+    def build_client(self, name: str, backend: BackendConfig) -> Client:
+        headers = self.static_headers(backend)
+        auth: Any = None
+        if backend.auth.type == "oauth":
             auth = self._build_oauth_provider(name, backend)
         logger.debug(
             "Built client for backend %s (auth=%s, %d static header(s))",
