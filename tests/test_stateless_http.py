@@ -1,10 +1,20 @@
-"""server.stateless_http: /mcp works without Mcp-Session-Id round-trips."""
+"""server.stateless_http: /mcp works without Mcp-Session-Id round-trips.
+
+Only handshake-era clients ever get a session; 2026-07-28 clients are
+sessionless either way (see test_protocol_eras.py), and must keep working
+with the setting on.
+"""
 
 from __future__ import annotations
 
 import json
 
 import httpx
+import httpx2
+import pytest
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 
 from mcp_gateway.app import create_app
 from mcp_gateway.config import GatewayConfig
@@ -13,7 +23,7 @@ from tests.conftest import free_port, gateway_config, obtain_tokens, register_cl
 MCP_HEADERS = {
     "Accept": "application/json, text/event-stream",
     "Content-Type": "application/json",
-    "MCP-Protocol-Version": "2025-06-18",
+    "MCP-Protocol-Version": LATEST_HANDSHAKE_VERSION,
 }
 
 
@@ -63,7 +73,7 @@ async def test_stateless_mode_needs_no_session_id(run_server):
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": LATEST_HANDSHAKE_VERSION,
                     "capabilities": {},
                     "clientInfo": {"name": "pytest", "version": "0"},
                 },
@@ -92,6 +102,42 @@ async def test_stateless_mode_needs_no_session_id(run_server):
             json={"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
         )
         assert r.status_code == 401
+
+        # No standalone notification stream without sessions.
+        r = await http.get(f"{base}/mcp", headers=headers)
+        assert r.status_code == 405
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_version"),
+    [("auto", LATEST_MODERN_VERSION), ("legacy", LATEST_HANDSHAKE_VERSION)],
+)
+async def test_stateless_mode_serves_both_eras(run_server, mode, expected_version):
+    port = free_port()
+    base = run_server(create_app(_config(port, stateless=True)), port).base_url
+    async with httpx.AsyncClient(timeout=10) as http:
+        token = await _token(http, base)
+
+    responses: list[httpx2.Response] = []
+
+    async def record(response: httpx2.Response) -> None:
+        responses.append(response)
+
+    transport = StreamableHttpTransport(
+        f"{base}/mcp",
+        headers={"Authorization": f"Bearer {token}"},
+        httpx_client_factory=lambda **kwargs: httpx2.AsyncClient(
+            event_hooks={"response": [record]}, **kwargs
+        ),
+    )
+    async with Client(transport, mode=mode) as client:
+        assert client.protocol_version == expected_version
+        assert "gateway_status" in {t.name for t in await client.list_tools()}
+        result = await client.call_tool("gateway_status", {})
+        assert not result.is_error
+
+    assert responses
+    assert all("mcp-session-id" not in r.headers for r in responses)
 
 
 async def test_stateful_mode_rejects_missing_session_id(run_server):

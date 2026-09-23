@@ -18,11 +18,12 @@ server:
   # logs, rate limiting, ...) and https detection are correct; otherwise
   # leave the default so a client can't spoof its own address.
   # trusted_proxy_ips: 127.0.0.1
-  # Stateless Streamable HTTP on /mcp: no Mcp-Session-Id is issued or
-  # required, each request is handled as its own MCP session. Turn on for
-  # clients/relays that drop that header (e.g. Copilot Studio behind an
-  # on-premises data gateway). Server-initiated requests (sampling,
-  # elicitation) and GET notification streams are unavailable when enabled.
+  # Stateless Streamable HTTP on /mcp for handshake-era clients (2026-07-28
+  # clients are sessionless anyway): no Mcp-Session-Id is issued or required,
+  # each request is handled as its own MCP session. Turn on for clients/relays
+  # that drop that header (e.g. Copilot Studio behind an on-premises data
+  # gateway). Server-initiated requests (sampling, elicitation) and GET
+  # notification streams are unavailable when enabled.
   stateless_http: ${MCP_GATEWAY_STATELESS_HTTP:-false}
 
 auth:

@@ -76,7 +76,8 @@ class ServerConfig(BaseModel):
     trusted_proxy_ips: str = "127.0.0.1"
     # Serve the client-facing /mcp endpoint in stateless Streamable HTTP mode:
     # no Mcp-Session-Id is issued or required, and every request gets a fresh
-    # MCP session. Needed behind relays that drop that header (e.g. Microsoft
+    # MCP session. Only changes anything for handshake-era clients; 2026-07-28
+    # clients are sessionless regardless. Needed behind relays that drop that header (e.g. Microsoft
     # Copilot Studio via a Power Platform custom connector + on-premises data
     # gateway). Server-initiated requests (sampling, elicitation) and
     # standalone GET notification streams are unavailable in this mode.
