@@ -68,6 +68,11 @@ building from source is only needed if you want to change the code.
   `msdocs_microsoft_docs_search`, …
 - Live proxying over Streamable HTTP; a down or not-yet-connected backend only
   removes its own tools instead of breaking the gateway
+- **Both MCP protocol eras** on the one `/mcp` endpoint, negotiated per connection: the
+  sessionless `2026-07-28` protocol (no `Mcp-Session-Id`; every request stands on its
+  own) and the handshake-era versions up to `2025-11-25` (`initialize` + session).
+  Backends are negotiated independently the same way, so modern clients reach
+  handshake-only backends and vice versa
 - Built-in `gateway_status` tool
 
 ## Quick start
