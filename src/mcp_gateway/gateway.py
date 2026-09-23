@@ -11,16 +11,18 @@ listing instead of breaking the whole gateway.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import functools
 import logging
 
 from fastmcp import Client, FastMCP
+from fastmcp.client.transports.base import TransportOptions
 from fastmcp.server import create_proxy
 from mcp.types import Icon, ToolAnnotations
 
 from mcp_gateway.config import GatewayConfig
 from mcp_gateway.oauth_server import GatewayOAuthProvider
-from mcp_gateway.upstream import BackendManager
+from mcp_gateway.upstream import BackendManager, NoForwardStreamableHttpTransport
 from mcp_gateway.web import STATIC_DIR
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,34 @@ def _server_icons() -> list[Icon]:
         logger.debug("Favicon not found at %s; MCP server will advertise no icon", _FAVICON_PATH)
         return []
     data_uri = "data:image/svg+xml;base64," + base64.b64encode(svg).decode("ascii")
-    return [Icon(src=data_uri, mimeType="image/svg+xml")]
+    return [Icon(src=data_uri, mime_type="image/svg+xml")]
+
+
+def _require_no_header_forwarding(name: str, client: Client) -> None:
+    """Refuse to start unless `client` can't pass the caller's token upstream.
+
+    FastMCP proxies forward the inbound request's headers (Authorization
+    included) to the backend by default. That is token passthrough, which the
+    MCP authorization spec explicitly forbids, and the single most important
+    invariant in the gateway. ``NoForwardStreamableHttpTransport`` turns it
+    off by overriding ``TransportOptions.forward_incoming_headers``; fail
+    startup loudly if a backend client bypasses that transport, or if a future
+    fastmcp release renames or removes the option -- either would re-enable
+    passthrough (or break every backend call) with no error at startup.
+    """
+    transport = getattr(client, "transport", None)
+    if not isinstance(transport, NoForwardStreamableHttpTransport):
+        raise TypeError(
+            f"Backend {name!r}: transport {type(transport).__name__} is not "
+            "NoForwardStreamableHttpTransport; cannot guarantee the "
+            "no-token-passthrough invariant."
+        )
+    if "forward_incoming_headers" not in {f.name for f in dataclasses.fields(TransportOptions)}:
+        raise RuntimeError(
+            "fastmcp's TransportOptions has no 'forward_incoming_headers' field; "
+            "cannot guarantee the no-token-passthrough invariant. This likely "
+            "means the installed fastmcp version changed its proxy transport API."
+        )
 
 
 def build_gateway(
@@ -85,10 +114,10 @@ def build_gateway(
         name="gateway_status",
         annotations=ToolAnnotations(
             title="Gateway Status",
-            readOnlyHint=True,
-            openWorldHint=False
+            read_only_hint=True,
+            open_world_hint=False
         ),
-        icons=[Icon(src=_status_icon_data_uri, mimeType="image/svg+xml")]
+        icons=[Icon(src=_status_icon_data_uri, mime_type="image/svg+xml")]
     )
     def gateway_status() -> list[dict]:
         """List the backends configured in this gateway and their connection state."""
@@ -99,27 +128,8 @@ def build_gateway(
         if not backend.enabled:
             logger.info("Backend %s is disabled; skipping", name)
             continue
+        _require_no_header_forwarding(name, clients[name])
         proxy = create_proxy(clients[name], name=f"proxy-{name}", mask_error_details=True)
-        # FastMCP proxies forward the inbound Authorization header upstream by
-        # default. That is token passthrough, which the MCP authorization spec
-        # explicitly forbids: the gateway token issued to the MCP client must
-        # never reach a backend. Backends only ever see credentials the
-        # gateway itself holds (static headers or its own upstream OAuth tokens).
-        #
-        # This is the single most important invariant in the gateway, so fail
-        # startup loudly rather than silently no-op if a future fastmcp
-        # release renames or removes the attribute -- a silent no-op here
-        # would re-enable token passthrough with no error and no test
-        # failure to catch it.
-        transport = getattr(clients[name], "transport", None)
-        if not hasattr(transport, "forward_incoming_headers"):
-            raise RuntimeError(
-                f"Backend {name!r}: transport {type(transport).__name__} has no "
-                "'forward_incoming_headers' attribute; cannot guarantee the "
-                "no-token-passthrough invariant. This likely means the "
-                "installed fastmcp version changed its proxy transport API."
-            )
-        transport.forward_incoming_headers = False
         mcp.mount(proxy, namespace=name)
         logger.info("Mounted backend %s (%s, auth=%s)", name, backend.url, backend.auth.type)
 

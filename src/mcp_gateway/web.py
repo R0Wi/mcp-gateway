@@ -221,7 +221,7 @@ def build_oauth_router() -> APIRouter:
         if not code:
             raise HTTPException(status_code=400, detail="Missing authorization code")
         manager = get_state(request).backend_manager
-        backend = manager.deliver_callback(code, state)
+        backend = manager.deliver_callback(code, state, params.get("iss"))
         if backend is None:
             return RedirectResponse("/ui/backends?error=No+matching+authorization+flow")
         result = await manager.wait_connect_result(backend)

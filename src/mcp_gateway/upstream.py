@@ -26,14 +26,22 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import httpx
+import httpx2
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.client.transports.base import TransportOptions
+from mcp import ClientSession
 from mcp.client.auth import OAuthClientProvider, TokenStorage
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from mcp.shared.auth import (
+    AuthorizationCodeResult,
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthToken,
+)
 from pydantic import AnyUrl
 
 from mcp_gateway.config import BackendConfig, GatewayConfig
@@ -47,6 +55,51 @@ CONNECT_FLOW_TIMEOUT_SECONDS = 300
 # Metadata Document for CIMD-capable upstream authorization servers.
 CLIENT_METADATA_PATH = "/oauth/client-metadata.json"
 UPSTREAM_CALLBACK_PATH = "/oauth/callback"
+
+
+class NoForwardStreamableHttpTransport(StreamableHttpTransport):
+    """Streamable HTTP transport that never forwards the caller's HTTP headers.
+
+    FastMCP proxies connect their backend client with
+    ``TransportOptions(forward_incoming_headers=True)``, which copies the
+    inbound request's headers -- including ``Authorization`` -- onto the
+    backend request. That is token passthrough, which the MCP authorization
+    spec forbids: the gateway token issued to an MCP client must never reach a
+    backend. The proxy re-applies that option to a fresh copy of the client on
+    every request, so it can't be switched off from the outside; this
+    transport overrides it at the one place it takes effect instead. Backends
+    only ever see credentials the gateway itself holds (static headers or its
+    own upstream OAuth tokens).
+
+    ``gateway.build_gateway`` refuses to start unless every backend client uses
+    this transport and ``TransportOptions`` still has the field overridden
+    here.
+    """
+
+    @contextlib.asynccontextmanager
+    async def connect_session(
+        self, *, transport_options: TransportOptions | None = None, **session_kwargs: Any
+    ) -> AsyncIterator[ClientSession]:
+        options = replace(transport_options or TransportOptions(), forward_incoming_headers=False)
+        async with super().connect_session(
+            transport_options=options, **session_kwargs
+        ) as session:
+            yield session
+
+
+async def probe_backend(client: Client) -> str:
+    """Prove a connected `client`'s backend is live; returns a short detail.
+
+    ``ping`` only exists in the handshake-era protocol: the sessionless
+    ``2026-07-28`` era dropped it along with the rest of the lifecycle
+    methods, and a modern backend answers it with "Method not found". On a
+    modern connection the ``server/discover`` round trip that opened it
+    already proved the backend answers, so there is nothing more to send.
+    """
+    if client.initialize_result is None:
+        return f"Connected (protocol {client.protocol_version})"
+    await client.ping()
+    return f"Ping succeeded (protocol {client.protocol_version})"
 
 
 class NotConnectedError(Exception):
@@ -154,7 +207,7 @@ class DbTokenStorage(TokenStorage):
         )
 
 
-class _ForcedChallengeAuth(httpx.Auth):
+class _ForcedChallengeAuth(httpx2.Auth):
     """Wraps an OAuthClientProvider so its interactive path always runs.
 
     ``async_auth_flow`` only takes the interactive path when a request comes
@@ -165,7 +218,7 @@ class _ForcedChallengeAuth(httpx.Auth):
     by plain ``client.ping()`` waits out ``start_connect``'s timeout without
     ever producing an authorize URL.
 
-    Relays every request/response pair between ``httpx.AsyncClient`` and the
+    Relays every request/response pair between ``httpx2.AsyncClient`` and the
     provider's own generator untouched, with two exceptions:
 
     - the probe's response is replaced by a synthetic 401 unless the backend
@@ -176,9 +229,9 @@ class _ForcedChallengeAuth(httpx.Auth):
       token, is dropped: nothing here reads that response, and a GET against
       a streamable-HTTP endpoint can block on an open SSE stream.
 
-    Everything else -- generator lifecycle (``httpx`` closes it in a
+    Everything else -- generator lifecycle (``httpx2`` closes it in a
     ``finally`` regardless of how the flow ends), redirects, timeouts,
-    proxy/TLS config, response reads -- is handled by ``httpx.AsyncClient``
+    proxy/TLS config, response reads -- is handled by ``httpx2.AsyncClient``
     itself, the same as for any real request the provider would ever see.
     """
 
@@ -187,7 +240,7 @@ class _ForcedChallengeAuth(httpx.Auth):
     def __init__(self, provider: OAuthClientProvider) -> None:
         self._provider = provider
 
-    async def async_auth_flow(self, request: httpx.Request):
+    async def async_auth_flow(self, request: httpx2.Request):
         inner = self._provider.async_auth_flow(request)
         try:
             outgoing = await inner.__anext__()
@@ -204,7 +257,7 @@ class _ForcedChallengeAuth(httpx.Auth):
                 if is_probe:
                     probe_sent = True
                     if response.status_code != 401:
-                        response = httpx.Response(401, request=outgoing)
+                        response = httpx2.Response(401, request=outgoing)
                 try:
                     outgoing = await inner.asend(response)
                 except StopAsyncIteration:
@@ -215,7 +268,7 @@ class _ForcedChallengeAuth(httpx.Auth):
 
 async def _drive_interactive_reauth(provider: OAuthClientProvider) -> None:
     """Force a fresh interactive authorization for `provider`."""
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         timeout=30.0, follow_redirects=True, auth=_ForcedChallengeAuth(provider)
     ) as http:
         await http.get(provider.context.server_url)
@@ -227,7 +280,7 @@ class ConnectFlow:
     def __init__(self, backend: str):
         self.backend = backend
         self.authorize_url: asyncio.Future[str] = asyncio.get_event_loop().create_future()
-        self.callback: asyncio.Future[tuple[str, str | None]] = (
+        self.callback: asyncio.Future[AuthorizationCodeResult] = (
             asyncio.get_event_loop().create_future()
         )
         self.done: asyncio.Future[str | None] = asyncio.get_event_loop().create_future()
@@ -271,7 +324,9 @@ class BackendManager:
             backend.auth.type,
             len(headers),
         )
-        transport = StreamableHttpTransport(backend.url, headers=headers or None, auth=auth)
+        transport = NoForwardStreamableHttpTransport(
+            backend.url, headers=headers or None, auth=auth
+        )
         return Client(transport)
 
     def _build_oauth_provider(self, name: str, backend: BackendConfig) -> OAuthClientProvider:
@@ -325,7 +380,6 @@ class BackendManager:
             storage=DbTokenStorage(self.storage, name, static_client_info),
             redirect_handler=self._make_redirect_handler(name),
             callback_handler=self._make_callback_handler(name),
-            timeout=CONNECT_FLOW_TIMEOUT_SECONDS,
             client_metadata_url=client_metadata_url,
         )
         self._oauth_providers[name] = provider
@@ -371,7 +425,7 @@ class BackendManager:
         return redirect_handler
 
     def _make_callback_handler(self, backend: str):
-        async def callback_handler() -> tuple[str, str | None]:
+        async def callback_handler() -> AuthorizationCodeResult:
             flow = self._flows_by_backend.get(backend)
             if flow is None:
                 raise NotConnectedError(f"No active connect flow for backend '{backend}'")
@@ -427,7 +481,7 @@ class BackendManager:
                 # Confirm the freshly-obtained token actually works end to
                 # end against the real backend.
                 async with client:
-                    await client.ping()
+                    await probe_backend(client)
                 logger.info("Backend %s: OAuth connect flow succeeded", name)
                 flow.done.set_result(None)
             except Exception as exc:  # noqa: BLE001 - report to the waiting UI
@@ -448,7 +502,9 @@ class BackendManager:
                 f"Backend '{name}' did not redirect to an authorization endpoint within 60s"
             ) from None
 
-    def deliver_callback(self, code: str, state: str | None) -> str | None:
+    def deliver_callback(
+        self, code: str, state: str | None, iss: str | None = None
+    ) -> str | None:
         """Route an upstream authorization callback to the waiting flow.
 
         Returns the backend name the callback was delivered to, or None.
@@ -463,6 +519,9 @@ class BackendManager:
         the forged code from ever being exchanged, but the legitimate flow is
         consumed and has to be restarted). A request that fails to match is
         now simply ignored, leaving any real pending flow untouched.
+
+        ``iss`` is the RFC 9207 authorization-response issuer, if the upstream
+        AS sent one; the SDK checks it against the discovered AS metadata.
         """
         flow: ConnectFlow | None = self._flows_by_state.get(state) if state is not None else None
         if flow is None or flow.callback.done():
@@ -470,7 +529,7 @@ class BackendManager:
             return None
         self._flows_by_state.pop(state, None)
         logger.debug("Backend %s: delivering upstream OAuth callback", flow.backend)
-        flow.callback.set_result((code, state))
+        flow.callback.set_result(AuthorizationCodeResult(code=code, state=state, iss=iss))
         return flow.backend
 
     async def wait_connect_result(self, name: str) -> str | None:
@@ -573,7 +632,7 @@ class BackendManager:
         try:
             async with client:
                 try:
-                    await client.ping()
+                    detail = await probe_backend(client)
                 except Exception as exc:  # noqa: BLE001 - report to the waiting UI
                     reported = True
                     yield {
@@ -582,7 +641,7 @@ class BackendManager:
                         "detail": f"{type(exc).__name__}: {exc}",
                     }
                     return
-                yield {"check": "ping", "status": "ok", "detail": "Ping succeeded"}
+                yield {"check": "ping", "status": "ok", "detail": detail}
 
                 yield {"check": "auth", "status": "running"}
                 try:

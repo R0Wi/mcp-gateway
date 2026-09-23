@@ -4,7 +4,7 @@
   let { name, onclose } = $props();
 
   const CHECKS = [
-    { key: 'ping', label: 'Ping MCP upstream' },
+    { key: 'ping', label: 'Reach MCP upstream' },
     { key: 'auth', label: 'Check tokens / auth' },
     { key: 'list_tools', label: 'List tools' },
   ];

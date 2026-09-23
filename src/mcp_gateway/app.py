@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # and its own message format (plain or Rich-colored), independent of the
 # logging.basicConfig() setup in mcp_gateway/__init__.py. Strip that handler
 # and let the logger propagate instead, so fastmcp's own log lines share the
-# same format as everything else (mcp_gateway.*, httpx, mcp.server.*, ...).
+# same format as everything else (mcp_gateway.*, httpx2, mcp.server.*, ...).
 # Safe to do unconditionally here: build_gateway (imported above) imports
 # fastmcp, which has by this point already run its own configure_logging().
 _fastmcp_logger = logging.getLogger("fastmcp")
