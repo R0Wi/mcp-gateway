@@ -79,7 +79,9 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
     mcp = build_gateway(config, provider, manager, clients)
     # The MCP endpoint lives at <public_url>/mcp; auth + well-known routes sit
     # at the root of the same app per RFC 8414/9728.
-    mcp_app = mcp.http_app(path="/mcp")
+    mcp_app = mcp.http_app(path="/mcp", stateless_http=config.server.stateless_http)
+    if config.server.stateless_http:
+        logger.info("MCP endpoint running in stateless HTTP mode (no Mcp-Session-Id)")
 
     async def _purge_loop() -> None:
         while True:

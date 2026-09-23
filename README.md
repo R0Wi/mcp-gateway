@@ -117,6 +117,21 @@ uses its CIMD client ID), and opens your browser: log in with a user from
 Add `https://mcp.example.com/mcp` as a custom connector. The browser redirect to
 `https://claude.ai/api/mcp/auth_callback` goes through the same login/consent flow.
 
+### Clients behind session-dropping relays (stateless mode)
+
+Clients on the sessionless `2026-07-28` protocol never use `Mcp-Session-Id`, so they
+work behind any relay. Handshake-era clients (`initialize` + session, up to `2025-11-25`)
+do, and some relays don't carry that header through, so the second request of a session
+fails. One example is Microsoft Copilot Studio reaching an on-prem gateway through a
+Power Platform custom connector and on-premises data gateway. For these, set
+`server.stateless_http: true` (or `MCP_GATEWAY_STATELESS_HTTP=true` with the example
+config). `/mcp` then issues no session ID to handshake-era clients either and handles
+every request on its own; `2026-07-28` clients behave the same either way. OAuth is
+unaffected, because each request still carries its bearer token. In this mode the
+gateway can't send requests to handshake-era clients (sampling, elicitation) and doesn't
+serve the standalone GET notification stream (`GET /mcp` answers 405). Backend
+connections work the same either way.
+
 ### Connect OAuth backends
 
 Open `https://mcp.example.com/ui/backends`, sign in, and press **Connect** next to each
