@@ -341,7 +341,7 @@ misdirected backup, a shared volume snapshot, a support bundle.
 ```bash
 uv venv && uv pip install -e ".[dev]"     # or: pip install -e ".[dev]"
 (cd ui && npm install && npm run build)   # build the Svelte UI
-pytest                                    # 71 tests incl. full e2e OAuth flows
+pytest                                    # 97 tests incl. full e2e OAuth flows
 mcp-gateway run -c config.yaml
 ```
 
