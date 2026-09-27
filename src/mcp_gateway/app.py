@@ -13,12 +13,19 @@ from fastapi.responses import JSONResponse
 from mcp_gateway.config import GatewayConfig, load_config
 from mcp_gateway.gateway import build_gateway
 from mcp_gateway.oauth_server import GatewayOAuthProvider
+from mcp_gateway.oidc import OIDCClient, PendingLoginCodec
 from mcp_gateway.ratelimit import RateLimiter
 from mcp_gateway.state import GatewayState
 from mcp_gateway.storage import Storage
 from mcp_gateway.upstream import BackendManager
 from mcp_gateway.users import SessionManager
-from mcp_gateway.web import build_auth_router, build_oauth_router, build_ui_router
+from mcp_gateway.web import (
+    OIDC_CALLBACK_PATH,
+    build_auth_router,
+    build_oauth_router,
+    build_oidc_router,
+    build_ui_router,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +70,12 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
         config = load_config(config)
 
     _warn_on_plaintext_passwords(config)
+    if config.auth.active_oidc:
+        logger.info(
+            "Browser login via OpenID Connect provider %s (local password login %s)",
+            config.auth.active_oidc.issuer,
+            "also enabled" if config.auth.password_login_enabled else "disabled",
+        )
 
     logger.debug("Opening storage at %s", config.storage.path)
     storage = Storage(config.storage.path, config.auth.encryption_key)
@@ -120,6 +133,16 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
     app.state.sessions = SessionManager(
         session_secret, config.auth.login_session_expiry_seconds, storage
     )
+    oidc_config = config.auth.active_oidc
+    app.state.oidc_client = (
+        OIDCClient(oidc_config, f"{config.server.public_url}{OIDC_CALLBACK_PATH}")
+        if oidc_config
+        else None
+    )
+    # Signs the short-lived cookie that carries a login's PKCE verifier and
+    # nonce across the redirect to the provider; same secret as the session
+    # cookie, different itsdangerous salt.
+    app.state.oidc_flows = PendingLoginCodec(session_secret)
     app.state.login_limiter = RateLimiter(*LOGIN_RATE_LIMIT)
     app.state.register_limiter = RateLimiter(*REGISTER_RATE_LIMIT)
 
@@ -165,6 +188,7 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
         return response
 
     app.include_router(build_auth_router())
+    app.include_router(build_oidc_router())
     app.include_router(build_oauth_router())
     app.include_router(build_ui_router())
 

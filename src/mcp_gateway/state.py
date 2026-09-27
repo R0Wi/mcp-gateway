@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from mcp_gateway.config import GatewayConfig
     from mcp_gateway.oauth_server import GatewayOAuthProvider
+    from mcp_gateway.oidc import OIDCClient, PendingLoginCodec
     from mcp_gateway.ratelimit import RateLimiter
     from mcp_gateway.storage import Storage
     from mcp_gateway.upstream import BackendManager
@@ -34,6 +35,10 @@ class GatewayState(State):
     backend_manager: BackendManager
     backend_clients: dict[str, Client]
     sessions: SessionManager
+    # None unless auth.oidc is configured and enabled; oidc_flows (the
+    # signer for the in-flight login cookie) is always present.
+    oidc_client: OIDCClient | None
+    oidc_flows: PendingLoginCodec
     login_limiter: RateLimiter
     register_limiter: RateLimiter
 
