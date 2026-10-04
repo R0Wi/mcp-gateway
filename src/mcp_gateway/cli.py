@@ -109,7 +109,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check":
         config = load_config(args.config)
-        print(f"OK: {len(config.auth.users)} user(s), {len(config.backends)} backend(s)")
+        print(
+            f"OK: {len(config.auth.users)} user(s), {len(config.auth.oidc)} OIDC "
+            f"provider(s), {len(config.backends)} backend(s)"
+        )
         return 0
 
     if args.command == "migrate":
