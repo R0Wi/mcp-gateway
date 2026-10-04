@@ -42,6 +42,15 @@
       username = me.username;
       if (username) {
         await refresh();
+        // Back from an external (OIDC) sign-in started by a Connect click:
+        // the login was a full-page round trip, so onLogin() never ran.
+        const next = params.get('login_next');
+        if (next?.startsWith('connect:')) {
+          params.delete('login_next');
+          const rest = params.toString();
+          window.history.replaceState(null, '', `/ui/backends${rest ? `?${rest}` : ''}`);
+          await connect(next.slice(8));
+        }
       }
     } catch (e) {
       error = e.message;

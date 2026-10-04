@@ -86,6 +86,11 @@ Request flow, root to leaf:
   issuance/rotation policy. `authorize` parks the request as a transaction and redirects
   to `/ui/authorize?txn=…`; the Svelte UI drives login/consent through `web.py`'s JSON
   API and finally calls `complete_authorization`.
+- `oidc.py` is an optional third leg: the gateway as an OIDC *relying party* for its own
+  login page (standard OIDC or Entra ID, `auth.oidc` in config). It only establishes who
+  signed in and ends in the same `SessionManager` cookie as a password login; provider
+  tokens are discarded. Flow state (state/nonce/PKCE verifier) is a signed cookie, not
+  server state. Routes are `/auth/oidc/<name>/{login,callback}` in `web.py`.
 - `upstream.py` uses the official SDK `OAuthClientProvider` with `DbTokenStorage`.
   OAuth backends are connected interactively **once** via `/oauth/connect/<backend>` in a
   browser; MCP traffic never triggers an interactive flow on its own. `ConnectFlow` state

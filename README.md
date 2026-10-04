@@ -48,7 +48,9 @@ building from source is only needed if you want to change the code.
   authorization codes — all stored **hashed**; client records encrypted at rest
 - Loopback redirect URIs match **port-agnostically** (Claude Code CLI registers one
   port and authorizes with another); non-loopback URIs require exact registration
-- Small **Svelte 5** login + consent UI (single local identity from the config file)
+- Small **Svelte 5** login + consent UI: local users from the config file and/or
+  **external OpenID Connect sign-in** — any standard OIDC provider (Keycloak, Authentik,
+  Okta, Google, …) or **Microsoft Entra ID** (see [Single sign-on](#single-sign-on-oidc--entra-id))
 
 **Backend-facing:**
 
@@ -110,7 +112,8 @@ claude mcp add --transport http gateway https://mcp.example.com/mcp
 
 Claude Code discovers the gateway's authorization server, registers itself via DCR (or
 uses its CIMD client ID), and opens your browser: log in with a user from
-`config.yaml`, approve, done. No tokens to paste.
+`config.yaml` (or your identity provider, if [single sign-on](#single-sign-on-oidc--entra-id)
+is configured), approve, done. No tokens to paste.
 
 ### Connect Claude.ai / Claude Code web (custom connector)
 
@@ -177,6 +180,69 @@ upstream AS advertises CIMD support (requires an HTTPS `public_url`); otherwise 
 falls back to Dynamic Client Registration. If the upstream AS supports neither (e.g.
 GitHub's), set `client_id` (and `client_secret`, if the app is confidential) to use a
 pre-registered OAuth client instead — CIMD/DCR are skipped entirely.
+
+### Single sign-on (OIDC / Entra ID)
+
+Instead of — or alongside — the local `users`, the login page can offer
+"Sign in with …" buttons for external OpenID Connect providers. `users` may then be
+left out entirely. Each provider is keyed by a short name; register the gateway at
+the provider as a **web application** with the redirect URI
+`<public_url>/auth/oidc/<name>/callback`.
+
+```yaml
+auth:
+  oidc:
+    entra:                                   # Microsoft Entra ID
+      type: entra
+      tenant_id: ${ENTRA_TENANT_ID}          # directory ID or verified domain
+      client_id: ${ENTRA_CLIENT_ID}
+      client_secret: ${ENTRA_CLIENT_SECRET}
+      allowed_roles: ["MCP.User"]            # app role assigned in Enterprise applications
+    keycloak:                                # any standard OIDC provider
+      type: oidc
+      issuer: https://sso.example.com/realms/main
+      client_id: mcp-gateway
+      client_secret: ${KEYCLOAK_CLIENT_SECRET}
+      allowed_domains: ["example.com"]
+```
+
+Signing in at the provider only proves *who* someone is. Who may use the gateway is
+decided per provider by allow rules — a user matching any one of them is admitted
+(case-insensitive); configuring none is a startup error unless you set
+`allow_all_users: true` explicitly:
+
+| field             | matches                                                                     |
+| ----------------- | --------------------------------------------------------------------------- |
+| `allowed_users`   | the username claim (`email` for `oidc`, `preferred_username` for `entra`)   |
+| `allowed_domains` | the domain part of that username                                            |
+| `allowed_groups`  | the `groups_claim` (default `groups`; Entra: group **object IDs**)          |
+| `allowed_roles`   | the `roles_claim` (default `roles`; Entra app roles)                        |
+
+`username_claim`, `groups_claim` and `roles_claim` are configurable; dotted paths reach
+nested claims (e.g. Keycloak's `realm_access.roles`). Other options: `display_name`
+(button label), `scopes` (default `openid profile email`), `discovery_url`,
+`token_endpoint_auth_method`, `extra_authorize_params` (e.g. `prompt`, `domain_hint`).
+`client_secret` may be omitted for a public client.
+
+**Entra ID specifics.** The issuer is derived from `tenant_id` and `authority_host`
+(default `https://login.microsoftonline.com`; set it for national clouds). For a
+multi-tenant app (`tenant_id: organizations` or `common`) the tenant-templated issuer is
+checked against each token's `tid` claim, and `allowed_tenants` is required. Prefer
+**app roles** (`allowed_roles`) over groups: Entra omits the `groups` claim for users in
+more than ~200 groups ("group overage"), and only emits it at all if the app
+registration's *Token configuration* adds it. Microsoft advises against authorizing on
+`preferred_username`/`email`, which are mutable; `allowed_users` is convenient for a
+single-tenant app but roles are the robust choice.
+
+How it works: authorization code flow with PKCE (S256), `state` and `nonce`; the flow
+state lives in a short-lived signed, `HttpOnly` cookie bound to the browser that started
+the sign-in, so a callback URL replayed in another browser is rejected before its code
+is redeemed. ID tokens are verified against the provider's JWKS (asymmetric algorithms
+only) along with `iss`, `aud`, `azp`, `exp` and `nonce`; missing claims are topped up
+from the userinfo endpoint (standard OIDC only). Provider tokens are discarded after
+sign-in — never stored, never forwarded to backends. The result is the same gateway
+session as a password login; signing out ends the gateway session only, not the
+session at the identity provider.
 
 ### Encryption key
 
@@ -283,6 +349,7 @@ mcp-gateway run -c config.yaml --log-level debug
 | `/.well-known/oauth-authorization-server`     | RFC 8414 AS metadata (+ OIDC alias)            |
 | `/authorize`, `/token`, `/register`, `/revoke`| OAuth 2.1 endpoints (PKCE, DCR, revocation)    |
 | `/ui/authorize`                               | login + consent (Svelte 5)                     |
+| `/auth/oidc/<name>/login`, `/auth/oidc/<name>/callback` | external OIDC / Entra ID sign-in       |
 | `/ui/backends`                                | backend connection status / connect / disconnect |
 | `/oauth/client-metadata.json`                 | the gateway's own CIMD document (upstream leg) |
 | `/oauth/connect/<backend>`, `/oauth/callback` | upstream OAuth connect flow                    |
@@ -323,6 +390,9 @@ misdirected backup, a shared volume snapshot, a support bundle.
 - Tokens issued to MCP clients are never forwarded to backends, and backend
   credentials never reach MCP clients.
 - Sessions are `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS.
+- External sign-in (OIDC / Entra ID) requires explicit allow rules, PKCE + nonce, and a
+  browser-bound flow cookie; return paths after sign-in are restricted to the gateway's
+  own UI (no open redirect).
 - Login and Dynamic Client Registration (`/register`) are rate-limited per source IP;
   password checks run off the event loop so a flood of attempts can't stall the server.
 - Anonymous DCR/CIMD client registrations that never complete an authorization are
@@ -341,12 +411,13 @@ misdirected backup, a shared volume snapshot, a support bundle.
 ```bash
 uv venv && uv pip install -e ".[dev]"     # or: pip install -e ".[dev]"
 (cd ui && npm install && npm run build)   # build the Svelte UI
-pytest                                    # 71 tests incl. full e2e OAuth flows
+pytest                                    # full e2e OAuth + OIDC sign-in flows
 mcp-gateway run -c config.yaml
 ```
 
 The test suite spins up real gateways (and a second instance acting as an
-OAuth-protected upstream) and drives complete DCR/CIMD + PKCE flows over HTTP.
+OAuth-protected upstream, plus a minimal OpenID provider for the sign-in tests) and
+drives complete DCR/CIMD + PKCE flows over HTTP.
 
 ### Adding a migration
 

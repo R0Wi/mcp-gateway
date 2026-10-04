@@ -5,10 +5,12 @@ Everything is driven by a single YAML file (see config.example.yaml).
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -59,6 +61,176 @@ class UserConfig(BaseModel):
         return self
 
 
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def require_https_url(url: str, field: str) -> str:
+    """Reject non-HTTPS identity-provider URLs (loopback is allowed, for local testing)."""
+    parsed = urlparse(url)
+    if parsed.scheme == "https" and parsed.netloc:
+        return url
+    if parsed.scheme == "http" and _is_loopback_host(parsed.hostname):
+        return url
+    raise ValueError(f"{field} must be an https:// URL (got {url!r})")
+
+
+# Entra ID tenant aliases that accept users from more than one tenant.
+ENTRA_MULTI_TENANT_ALIASES = frozenset({"common", "organizations", "consumers"})
+
+
+class OIDCProviderConfig(BaseModel):
+    """An external OpenID Connect identity provider users can sign in with.
+
+    ``type: oidc`` is any standards-compliant provider (Keycloak, Authentik,
+    Google, Okta, Auth0, ...), located via OIDC discovery from ``issuer``.
+    ``type: entra`` is Microsoft Entra ID (Azure AD): the issuer is derived
+    from ``tenant_id``, and the tenant-templated issuer of the multi-tenant
+    endpoints is validated against the token's ``tid`` claim.
+
+    Signing in with a provider only proves *who* the user is. Who may use the
+    gateway is decided by the ``allowed_*`` rules (a user passing any one of
+    them is admitted), or ``allow_all_users: true`` to admit everyone the
+    provider authenticates.
+    """
+
+    type: Literal["oidc", "entra"] = "oidc"
+    # Button label on the login page. Defaults to "Microsoft" for Entra, else the provider key.
+    display_name: str | None = None
+
+    # type == "oidc": issuer URL; discovery is fetched from
+    # <issuer>/.well-known/openid-configuration unless discovery_url is set.
+    issuer: str | None = None
+    discovery_url: str | None = None
+
+    # type == "entra": directory (tenant) ID or a verified domain. The aliases
+    # "organizations" / "common" / "consumers" enable multi-tenant sign-in and
+    # then require allowed_tenants.
+    tenant_id: str | None = None
+    # Entra authority host; override for national clouds
+    # (e.g. https://login.microsoftonline.us, https://login.chinacloudapi.cn).
+    authority_host: str = "https://login.microsoftonline.com"
+    # type == "entra": tenant IDs (the token's `tid` claim) allowed to sign in.
+    allowed_tenants: list[str] = Field(default_factory=list)
+
+    client_id: str
+    # Omit for a public client (PKCE only), if the provider allows that.
+    client_secret: str | None = None
+    # How client_secret is presented to the token endpoint. Default: picked from
+    # the provider's discovery document (client_secret_basic preferred).
+    token_endpoint_auth_method: (
+        Literal["client_secret_basic", "client_secret_post", "none"] | None
+    ) = None
+    scopes: list[str] = Field(default_factory=lambda: ["openid", "profile", "email"])
+    # Extra query parameters for the authorization request (e.g. prompt,
+    # domain_hint, login_hint, hd).
+    extra_authorize_params: dict[str, str] = Field(default_factory=dict)
+
+    # Claim used as the gateway username. Default: "preferred_username" for
+    # Entra, "email" otherwise. Dotted paths address nested claims.
+    username_claim: str | None = None
+    # Claims holding the user's groups / roles (dotted paths address nested
+    # claims, e.g. Keycloak's "realm_access.roles"). Entra emits group object
+    # IDs in "groups" and app roles in "roles".
+    groups_claim: str = "groups"
+    roles_claim: str = "roles"
+
+    # Authorization rules (case-insensitive). A user matching any one is admitted.
+    allowed_users: list[str] = Field(default_factory=list)
+    # Domain part of the username (e.g. "example.com" admits alice@example.com).
+    allowed_domains: list[str] = Field(default_factory=list)
+    allowed_groups: list[str] = Field(default_factory=list)
+    allowed_roles: list[str] = Field(default_factory=list)
+    # Admit every user the provider authenticates. Must be set explicitly;
+    # with a public provider (Google, a multi-tenant Entra app, ...) that
+    # means *anyone* with an account there.
+    allow_all_users: bool = False
+
+    @model_validator(mode="after")
+    def _check(self) -> OIDCProviderConfig:
+        if self.type == "oidc":
+            if not self.issuer:
+                raise ValueError("OIDC provider of type 'oidc' requires 'issuer'")
+            self.issuer = require_https_url(self.issuer, "issuer")
+            if self.tenant_id or self.allowed_tenants:
+                raise ValueError("'tenant_id'/'allowed_tenants' only apply to type 'entra'")
+        else:
+            if not self.tenant_id:
+                raise ValueError("OIDC provider of type 'entra' requires 'tenant_id'")
+            if self.issuer:
+                raise ValueError(
+                    "type 'entra' derives the issuer from 'tenant_id'; don't set 'issuer'"
+                )
+            self.authority_host = require_https_url(
+                self.authority_host.rstrip("/"), "authority_host"
+            )
+            if self.is_multi_tenant and not self.allowed_tenants:
+                raise ValueError(
+                    f"Entra tenant_id {self.tenant_id!r} admits users from any tenant; "
+                    "set 'allowed_tenants' to the tenant IDs that may sign in"
+                )
+        if self.discovery_url:
+            self.discovery_url = require_https_url(self.discovery_url, "discovery_url")
+        if "openid" not in self.scopes:
+            self.scopes = ["openid", *self.scopes]
+        if (
+            self.token_endpoint_auth_method in ("client_secret_basic", "client_secret_post")
+            and not self.client_secret
+        ):
+            raise ValueError(
+                f"token_endpoint_auth_method {self.token_endpoint_auth_method!r} "
+                "requires 'client_secret'"
+            )
+        has_rule = any(
+            (self.allowed_users, self.allowed_domains, self.allowed_groups, self.allowed_roles)
+        )
+        if not has_rule and not self.allow_all_users:
+            raise ValueError(
+                "OIDC provider needs at least one of allowed_users / allowed_domains / "
+                "allowed_groups / allowed_roles, or an explicit 'allow_all_users: true'"
+            )
+        return self
+
+    @property
+    def is_multi_tenant(self) -> bool:
+        return self.type == "entra" and (self.tenant_id or "").lower() in (
+            ENTRA_MULTI_TENANT_ALIASES
+        )
+
+    @property
+    def resolved_issuer(self) -> str:
+        """The configured issuer (for Entra: derived from tenant + authority host)."""
+        if self.type == "entra":
+            return f"{self.authority_host}/{self.tenant_id}/v2.0"
+        assert self.issuer is not None
+        return self.issuer.rstrip("/")
+
+    @property
+    def resolved_discovery_url(self) -> str:
+        if self.discovery_url:
+            return self.discovery_url
+        return f"{self.resolved_issuer}/.well-known/openid-configuration"
+
+    @property
+    def resolved_username_claim(self) -> str:
+        if self.username_claim:
+            return self.username_claim
+        return "preferred_username" if self.type == "entra" else "email"
+
+    @property
+    def resolved_display_name(self) -> str | None:
+        if self.display_name:
+            return self.display_name
+        return "Microsoft" if self.type == "entra" else None
+
+
 class ServerConfig(BaseModel):
     # Public HTTPS URL clients use to reach the gateway (behind the reverse proxy).
     public_url: str
@@ -82,7 +254,12 @@ class ServerConfig(BaseModel):
 
 
 class AuthConfig(BaseModel):
-    users: list[UserConfig]
+    # Local username/password accounts. May be empty when users sign in via `oidc` only.
+    users: list[UserConfig] = Field(default_factory=list)
+    # External OpenID Connect providers (standard OIDC or Microsoft Entra ID),
+    # keyed by a short name used in the callback URL
+    # <public_url>/auth/oidc/<name>/callback.
+    oidc: dict[str, OIDCProviderConfig] = Field(default_factory=dict)
     # Fernet key (or arbitrary passphrase, which is stretched via scrypt) used to
     # encrypt secrets at rest in the SQLite database. Normally supplied via
     # ${MCP_GATEWAY_ENCRYPTION_KEY}; set MCP_GATEWAY_ENCRYPTION_KEY_FILE instead
@@ -113,6 +290,19 @@ class AuthConfig(BaseModel):
     # Scopes advertised to MCP clients. The gateway is a single-identity AS, so
     # scopes are informational; "mcp" is the default catch-all.
     scopes_supported: list[str] = Field(default_factory=lambda: ["mcp"])
+
+    @field_validator("oidc")
+    @classmethod
+    def _validate_oidc_names(
+        cls, v: dict[str, OIDCProviderConfig]
+    ) -> dict[str, OIDCProviderConfig]:
+        for name in v:
+            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", name):
+                raise ValueError(
+                    f"OIDC provider name {name!r} must be alphanumeric with '-'/'_' "
+                    "(it is part of the callback URL)"
+                )
+        return v
 
 
 class BackendAuthConfig(BaseModel):

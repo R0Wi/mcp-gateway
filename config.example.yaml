@@ -33,11 +33,59 @@ auth:
 
   # Local users allowed to approve OAuth authorization requests.
   # Generate a hash with: mcp-gateway hash-password
+  # Optional when at least one `oidc` provider below is configured.
   users:
     - username: admin
       password_hash: "$2b$12$REPLACE_ME_WITH_A_REAL_BCRYPT_HASH"
       # For quick local testing you may use a plaintext password instead:
       # password: change-me
+
+  # Optional: sign in through external OpenID Connect providers instead of
+  # (or in addition to) the local users above. Each provider shows up as a
+  # "Sign in with ..." button. Register the gateway as a web application at
+  # the provider with the redirect URI <public_url>/auth/oidc/<name>/callback.
+  #
+  # Authenticating at the provider only proves who someone is; who may use
+  # the gateway is decided by the allowed_* rules (any one match admits the
+  # user, case-insensitively). With none of them set you must say
+  # `allow_all_users: true` explicitly.
+  # oidc:
+  #   # Microsoft Entra ID (Azure AD). App registration -> Authentication ->
+  #   # Web platform -> redirect URI https://mcp.example.com/auth/oidc/entra/callback;
+  #   # Certificates & secrets -> new client secret.
+  #   entra:
+  #     type: entra
+  #     tenant_id: ${ENTRA_TENANT_ID}         # directory ID or verified domain
+  #     client_id: ${ENTRA_CLIENT_ID}
+  #     client_secret: ${ENTRA_CLIENT_SECRET}
+  #     # display_name: Contoso               # button label (default "Microsoft")
+  #     # username_claim: preferred_username  # default; or "email", "upn", ...
+  #     # Recommended: define an app role (App roles -> "MCP.User"), assign it
+  #     # to users/groups under Enterprise applications, and admit by role.
+  #     allowed_roles: ["MCP.User"]
+  #     # allowed_groups: ["<group object id>"]   # needs the groups claim (Token configuration)
+  #     # allowed_users: ["alice@contoso.com"]
+  #     # allowed_domains: ["contoso.com"]
+  #     # Multi-tenant apps (tenant_id: organizations / common) must list
+  #     # the tenant IDs allowed to sign in:
+  #     # allowed_tenants: ["00000000-0000-0000-0000-000000000000"]
+  #     # National clouds: authority_host: https://login.microsoftonline.us
+  #     # extra_authorize_params: { prompt: select_account }
+  #
+  #   # Any standards-compliant OpenID provider (Keycloak, Authentik, Okta,
+  #   # Auth0, Google, ...), discovered via <issuer>/.well-known/openid-configuration.
+  #   keycloak:
+  #     type: oidc
+  #     display_name: Keycloak
+  #     issuer: https://sso.example.com/realms/main
+  #     client_id: mcp-gateway
+  #     client_secret: ${KEYCLOAK_CLIENT_SECRET}
+  #     # scopes: [openid, profile, email]    # default
+  #     # username_claim: email               # default; "preferred_username", ...
+  #     allowed_domains: ["example.com"]
+  #     # allowed_groups: ["mcp-users"]       # groups_claim: groups (default)
+  #     # allowed_roles: ["mcp"]
+  #     # roles_claim: realm_access.roles     # dotted paths reach nested claims
 
   # Lifetimes (seconds)
   access_token_expiry_seconds: 3600

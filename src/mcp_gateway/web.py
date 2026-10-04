@@ -1,6 +1,7 @@
 """FastAPI routes for the interactive parts of the gateway.
 
 - ``/auth/api/*``   – JSON API consumed by the Svelte login/consent UI
+- ``/auth/oidc/*``  – browser login via external OpenID Connect providers
 - ``/oauth/*``      – upstream backend connect flow + hosted CIMD document
 - ``/ui/*``         – the built Svelte single-page app
 - ``/healthz``      – liveness probe
@@ -12,13 +13,21 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import anyio
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
+from mcp_gateway.oidc import (
+    DEFAULT_RETURN_TO,
+    FLOW_COOKIE,
+    FLOW_COOKIE_PATH,
+    FLOW_MAX_AGE_SECONDS,
+    OIDCError,
+    safe_return_to,
+)
 from mcp_gateway.state import get_state
 from mcp_gateway.users import SESSION_COOKIE, verify_user
 
@@ -48,6 +57,19 @@ def _require_session(request: Request) -> str:
     return user
 
 
+def _set_session_cookie(request: Request, response: Response, username: str) -> None:
+    config = get_state(request).config
+    response.set_cookie(
+        SESSION_COOKIE,
+        get_state(request).sessions.create(username),
+        max_age=config.auth.login_session_expiry_seconds,
+        httponly=True,
+        secure=config.server.public_url.startswith("https://"),
+        samesite="lax",
+        path="/",
+    )
+
+
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
@@ -67,6 +89,14 @@ def build_auth_router() -> APIRouter:
     @router.get("/me")
     async def me(request: Request):
         return {"username": _session_user(request)}
+
+    @router.get("/login-options")
+    async def login_options(request: Request):
+        state = get_state(request)
+        return {
+            "password": bool(state.config.auth.users),
+            "providers": state.oidc.login_options(),
+        }
 
     @router.get("/txn/{txn_id}")
     async def get_txn(txn_id: str, request: Request):
@@ -96,15 +126,7 @@ def build_auth_router() -> APIRouter:
             logger.warning("Failed login attempt for username %r", body.username)
             raise HTTPException(status_code=401, detail="Invalid username or password")
         logger.info("User %r logged in", body.username)
-        response.set_cookie(
-            SESSION_COOKIE,
-            get_state(request).sessions.create(body.username),
-            max_age=config.auth.login_session_expiry_seconds,
-            httponly=True,
-            secure=config.server.public_url.startswith("https://"),
-            samesite="lax",
-            path="/",
-        )
+        _set_session_cookie(request, response, body.username)
         return {"username": body.username}
 
     @router.post("/logout")
@@ -161,6 +183,84 @@ def build_auth_router() -> APIRouter:
                 yield json.dumps(event) + "\n"
 
         return StreamingResponse(events(), media_type="application/x-ndjson")
+
+    return router
+
+
+def _with_login_error(return_to: str, message: str) -> str:
+    separator = "&" if "?" in return_to else "?"
+    return f"{return_to}{separator}{urlencode({'login_error': message})}"
+
+
+def build_oidc_router() -> APIRouter:
+    """Login through an external OpenID Connect provider (see oidc.py).
+
+    Both endpoints are top-level browser navigations, not fetches: the user
+    leaves for the identity provider and comes back. Failures therefore
+    redirect back into the UI with ``?login_error=`` rather than returning an
+    error body nobody would see.
+    """
+    router = APIRouter(prefix="/auth/oidc")
+
+    @router.get("/{name}/login")
+    async def oidc_login(name: str, request: Request):
+        state = get_state(request)
+        return_to = safe_return_to(request.query_params.get("return_to"))
+        if name not in state.oidc.providers:
+            raise HTTPException(status_code=404, detail="Unknown login provider")
+        if not state.login_limiter.allow(_client_ip(request)):
+            logger.warning("Login rate limit exceeded for %s", _client_ip(request))
+            return RedirectResponse(
+                _with_login_error(return_to, "Too many login attempts, try again later"),
+                status_code=303,
+            )
+        try:
+            authorize_url, flow_cookie = await state.oidc.start(name, return_to)
+        except OIDCError as exc:
+            return RedirectResponse(_with_login_error(return_to, str(exc)), status_code=303)
+        response = RedirectResponse(authorize_url, status_code=303)
+        # SameSite=Lax (not Strict): the provider's redirect back to the
+        # callback is a cross-site top-level GET, which Lax still carries.
+        response.set_cookie(
+            FLOW_COOKIE,
+            flow_cookie,
+            max_age=FLOW_MAX_AGE_SECONDS,
+            httponly=True,
+            secure=state.config.server.public_url.startswith("https://"),
+            samesite="lax",
+            path=FLOW_COOKIE_PATH,
+        )
+        return response
+
+    @router.get("/{name}/callback")
+    async def oidc_callback(name: str, request: Request):
+        state = get_state(request)
+        if name not in state.oidc.providers:
+            raise HTTPException(status_code=404, detail="Unknown login provider")
+        flow = state.oidc.read_flow(request.cookies.get(FLOW_COOKIE))
+        if flow is None:
+            # No (valid, unexpired) flow cookie: this browser never started a
+            # login, or took too long. Never act on the code in that case --
+            # it could be an attacker's, forced on this browser (login CSRF).
+            return RedirectResponse(
+                _with_login_error(
+                    DEFAULT_RETURN_TO,
+                    "Sign-in expired or was not started in this browser; please try again",
+                ),
+                status_code=303,
+            )
+        return_to = safe_return_to(flow.get("r"))
+        try:
+            identity = await state.oidc.finish(name, flow, dict(request.query_params))
+        except OIDCError as exc:
+            response = RedirectResponse(_with_login_error(return_to, str(exc)), status_code=303)
+        else:
+            logger.info("User %r logged in via OIDC provider %r", identity.username, name)
+            response = RedirectResponse(return_to, status_code=303)
+            _set_session_cookie(request, response, identity.username)
+        # One flow cookie, one attempt -- success or failure.
+        response.delete_cookie(FLOW_COOKIE, path=FLOW_COOKIE_PATH)
+        return response
 
     return router
 
