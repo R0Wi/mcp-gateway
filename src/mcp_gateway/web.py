@@ -96,6 +96,7 @@ def build_auth_router() -> APIRouter:
         return {
             "password": bool(state.config.auth.users),
             "providers": state.oidc.login_options(),
+            "auto_redirect": state.config.auth.oidc_auto_redirect,
         }
 
     @router.get("/txn/{txn_id}")

@@ -86,6 +86,11 @@ auth:
   #     # allowed_groups: ["mcp-users"]       # groups_claim: groups (default)
   #     # allowed_roles: ["mcp"]
   #     # roles_claim: realm_access.roles     # dotted paths reach nested claims
+  #
+  # With exactly one provider and no local `users`, skip the login page and
+  # go straight to the provider (opt-in). Not after a failed sign-in or an
+  # explicit sign-out, which show the page with its button instead.
+  # oidc_auto_redirect: true
 
   # Lifetimes (seconds)
   access_token_expiry_seconds: 3600

@@ -9,11 +9,16 @@
   let busy = $state(false);
   // null until /auth/api/login-options answers: which sign-in methods to offer.
   let options = $state(null);
+  // Set while leaving for the identity provider (auth.oidc_auto_redirect).
+  let redirectingTo = $state(null);
 
   // An external (OIDC) sign-in ends with a full-page redirect back here;
   // failures arrive as ?login_error=. Show it once, then drop it from the URL
   // so a reload doesn't replay it -- and so it isn't carried into return_to.
   const params = new URLSearchParams(window.location.search);
+  // Set by an explicit sign-out: auto-redirecting then would just sign the
+  // user straight back in through the provider's still-active session.
+  const signedOut = params.has('signed_out');
   if (params.has('login_error')) {
     error = params.get('login_error');
     params.delete('login_error');
@@ -24,12 +29,22 @@
   $effect(() => {
     api
       .loginOptions()
-      .then((o) => (options = o))
+      .then((o) => {
+        options = o;
+        // Never after a failed attempt (that would loop) or a sign-out.
+        if (o.auto_redirect && o.providers.length === 1 && !error && !signedOut) {
+          redirectingTo = o.providers[0].display_name;
+          window.location.replace(providerHref(o.providers[0].name));
+        }
+      })
       .catch(() => (options = { password: true, providers: [] }));
   });
 
   function providerHref(name) {
-    const returnTo = `${window.location.pathname}${window.location.search}`;
+    const query = new URLSearchParams(window.location.search);
+    query.delete('signed_out');
+    const rest = query.toString();
+    const returnTo = `${window.location.pathname}${rest ? `?${rest}` : ''}`;
     return `/auth/oidc/${encodeURIComponent(name)}/login?return_to=${encodeURIComponent(returnTo)}`;
   }
 
@@ -48,7 +63,12 @@
   }
 </script>
 
-{#if options}
+{#if redirectingTo}
+  <div class="spinner">Redirecting to {redirectingTo}…</div>
+{:else if options}
+  {#if signedOut}
+    <p class="muted">You have been signed out.</p>
+  {/if}
   {#if options.providers.length}
     <div class="providers">
       {#each options.providers as p (p.name)}

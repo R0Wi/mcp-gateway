@@ -112,6 +112,9 @@
 
   async function logout() {
     await api.logout();
+    // Marks the login page as reached by signing out, so an opted-in
+    // auto-redirect to the identity provider doesn't sign straight back in.
+    window.history.replaceState(null, '', '/ui/backends?signed_out=1');
     username = null;
     backends = [];
   }

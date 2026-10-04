@@ -224,6 +224,13 @@ nested claims (e.g. Keycloak's `realm_access.roles`). Other options: `display_na
 `token_endpoint_auth_method`, `extra_authorize_params` (e.g. `prompt`, `domain_hint`).
 `client_secret` may be omitted for a public client.
 
+**Skipping the login page.** With exactly one provider and no local `users`, set
+`auth.oidc_auto_redirect: true` to send the browser straight to the identity provider
+instead of showing a page with a single button (opt-in; the config is rejected if
+there's more than one way to sign in). The page is still shown after a failed sign-in,
+with the error, and after an explicit sign-out — otherwise the provider's still-active
+session would sign the user straight back in.
+
 **Entra ID specifics.** The issuer is derived from `tenant_id` and `authority_host`
 (default `https://login.microsoftonline.com`; set it for national clouds). For a
 multi-tenant app (`tenant_id: organizations` or `common`) the tenant-templated issuer is

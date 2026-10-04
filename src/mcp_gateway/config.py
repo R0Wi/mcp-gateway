@@ -260,6 +260,10 @@ class AuthConfig(BaseModel):
     # keyed by a short name used in the callback URL
     # <public_url>/auth/oidc/<name>/callback.
     oidc: dict[str, OIDCProviderConfig] = Field(default_factory=dict)
+    # Skip the login page and send the browser straight to the identity
+    # provider. Opt-in, and only valid when `oidc` has exactly one provider
+    # and there are no local `users` (i.e. there is nothing else to choose).
+    oidc_auto_redirect: bool = False
     # Fernet key (or arbitrary passphrase, which is stretched via scrypt) used to
     # encrypt secrets at rest in the SQLite database. Normally supplied via
     # ${MCP_GATEWAY_ENCRYPTION_KEY}; set MCP_GATEWAY_ENCRYPTION_KEY_FILE instead
@@ -290,6 +294,15 @@ class AuthConfig(BaseModel):
     # Scopes advertised to MCP clients. The gateway is a single-identity AS, so
     # scopes are informational; "mcp" is the default catch-all.
     scopes_supported: list[str] = Field(default_factory=lambda: ["mcp"])
+
+    @model_validator(mode="after")
+    def _check_auto_redirect(self) -> AuthConfig:
+        if self.oidc_auto_redirect and (self.users or len(self.oidc) != 1):
+            raise ValueError(
+                "auth.oidc_auto_redirect requires exactly one 'oidc' provider and no "
+                "local 'users'"
+            )
+        return self
 
     @field_validator("oidc")
     @classmethod

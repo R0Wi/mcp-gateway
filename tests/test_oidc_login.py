@@ -278,6 +278,7 @@ async def test_login_options_lists_providers(idp, start_gateway, entra_idp):
             {"name": "fake", "display_name": "Fake IdP", "type": "oidc"},
             {"name": "work", "display_name": "Microsoft", "type": "entra"},
         ],
+        "auto_redirect": False,
     }
 
 
@@ -544,6 +545,64 @@ async def test_unreachable_provider_reports_error(start_gateway):
         r = await http.get(f"{base}/auth/oidc/dead/login", params={"return_to": "/ui/backends"})
         assert r.status_code == 303
         assert "Could not reach" in login_error(r)
+
+
+# ------------------------------------------------------------ auto-redirect
+
+
+def _auth_config(**auth) -> GatewayConfig:
+    return GatewayConfig.model_validate(
+        {
+            "server": {"public_url": "https://gw.example"},
+            "auth": {"encryption_key": "k", **auth},
+        }
+    )
+
+
+_ONE_PROVIDER = {
+    "only": {"issuer": "https://idp.example", "client_id": "c", "allow_all_users": True}
+}
+
+
+async def test_auto_redirect_is_advertised_to_the_ui(idp, run_server):
+    port = free_port()
+    config = GatewayConfig.model_validate(
+        {
+            "server": {"public_url": f"http://127.0.0.1:{port}"},
+            "auth": {
+                "encryption_key": "k",
+                "oidc": {"fake": oidc_provider(idp)},
+                "oidc_auto_redirect": True,
+            },
+            "storage": {"path": ":memory:"},
+        }
+    )
+    base = run_server(create_app(config), port).base_url
+    async with httpx.AsyncClient() as http:
+        options = (await http.get(f"{base}/auth/api/login-options")).json()
+    assert options["auto_redirect"] is True
+    assert options["password"] is False
+    assert [p["name"] for p in options["providers"]] == ["fake"]
+
+
+def test_auto_redirect_is_off_by_default():
+    assert _auth_config(oidc=_ONE_PROVIDER).auth.oidc_auto_redirect is False
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        # Local users exist: there is a choice to make, so no redirect.
+        {"oidc": _ONE_PROVIDER, "users": [{"username": "a", "password": "p"}]},
+        # More than one provider: which one?
+        {"oidc": {**_ONE_PROVIDER, "other": _ONE_PROVIDER["only"]}},
+        # No provider at all.
+        {},
+    ],
+)
+def test_auto_redirect_requires_a_single_provider_and_no_users(auth):
+    with pytest.raises(ValidationError, match="oidc_auto_redirect requires"):
+        _auth_config(oidc_auto_redirect=True, **auth)
 
 
 # ------------------------------------------------------------ config
