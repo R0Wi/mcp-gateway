@@ -54,6 +54,18 @@ auth:
   #   - "https://claude.ai/api/mcp/auth_callback"
   #   - "https://claude.com/api/mcp/auth_callback"
 
+  # Pre-registered ("static") clients for MCP clients that support neither
+  # Dynamic Client Registration nor CIMD and only accept a fixed client ID /
+  # secret (e.g. Gemini Enterprise's custom MCP connector). Point such a
+  # client at <public_url>/authorize and <public_url>/token. The secret may be
+  # sent via HTTP Basic or in the form body; PKCE (S256) is still required.
+  # static_clients:
+  #   - client_id: gemini-enterprise
+  #     client_secret: ${GEMINI_CLIENT_SECRET}   # e.g. openssl rand -base64 32
+  #     client_name: Gemini Enterprise           # shown on the consent screen
+  #     redirect_uris:                           # exact match
+  #       - "https://vertexaisearch.cloud.google.com/oauth-redirect"
+
 storage:
   path: /data/gateway.db
 
