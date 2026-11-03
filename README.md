@@ -44,8 +44,10 @@ building from source is only needed if you want to change the code.
 - **Protected Resource Metadata** (RFC 9728); 401 responses carry
   `WWW-Authenticate: Bearer resource_metadata="…"` as Claude's connector requires
 - Resource indicators (RFC 8707) accepted and bound to issued tokens
-- Short-lived opaque access tokens, **rotating refresh tokens**, single-use
-  authorization codes — all stored **hashed**; client records encrypted at rest
+- Short-lived opaque access tokens, **rotating refresh tokens** (with a short reuse
+  grace window, `refresh_token_reuse_grace_seconds`, so concurrent or retried
+  refreshes don't break the connection), single-use authorization codes — all
+  stored **hashed**; client records encrypted at rest
 - Loopback redirect URIs match **port-agnostically** (Claude Code CLI registers one
   port and authorizes with another); non-loopback URIs require exact registration
 - Small **Svelte 5** login + consent UI (single local identity from the config file)

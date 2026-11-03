@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
 
-from tests.conftest import obtain_tokens, pkce_pair, register_client
+from mcp_gateway.app import create_app
+from mcp_gateway.storage import token_hash
+from tests.conftest import (
+    free_port,
+    gateway_config,
+    obtain_tokens,
+    pkce_pair,
+    register_client,
+)
 
 MCP_INIT = {
     "jsonrpc": "2.0",
@@ -180,33 +190,39 @@ async def test_authorization_code_single_use(base):
         assert second.status_code in (400, 401)
 
 
-async def test_refresh_token_rotation(base):
+async def _refresh(http: httpx.AsyncClient, base: str, client_id: str, refresh_token: str):
+    return await http.post(
+        f"{base}/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        },
+    )
+
+
+@pytest.fixture
+def strict_rotation_base(run_server):
+    """A gateway with refresh-token reuse grace disabled (strict single use)."""
+    port = free_port()
+    app = create_app(gateway_config(port, refresh_token_reuse_grace_seconds=0))
+    return run_server(app, port).base_url
+
+
+async def test_refresh_token_rotation(strict_rotation_base):
+    base = strict_rotation_base
     async with httpx.AsyncClient() as http:
         client_id = await register_client(http, base)
         tokens = await obtain_tokens(http, base, client_id)
 
-        r = await http.post(
-            f"{base}/token",
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": tokens["refresh_token"],
-                "client_id": client_id,
-            },
-        )
+        r = await _refresh(http, base, client_id, tokens["refresh_token"])
         assert r.status_code == 200
         new_tokens = r.json()
         assert new_tokens["access_token"] != tokens["access_token"]
         assert new_tokens["refresh_token"] != tokens["refresh_token"]
 
-        # Old refresh token is dead after rotation.
-        r = await http.post(
-            f"{base}/token",
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": tokens["refresh_token"],
-                "client_id": client_id,
-            },
-        )
+        # With no grace window, the old refresh token is dead after rotation.
+        r = await _refresh(http, base, client_id, tokens["refresh_token"])
         assert r.status_code in (400, 401)
 
         # New access token works.
@@ -216,6 +232,90 @@ async def test_refresh_token_rotation(base):
             headers={**MCP_HEADERS, "Authorization": f"Bearer {new_tokens['access_token']}"},
         )
         assert r.status_code == 200
+
+
+async def test_concurrent_refresh_with_same_token_both_succeed(base):
+    """Clients like Claude share one connector's credentials across several
+    surfaces and can refresh concurrently (or retry a refresh whose response
+    was lost). With instant revocation the loser got invalid_grant and the
+    client silently dropped the connector's tool list."""
+    async with httpx.AsyncClient() as http:
+        client_id = await register_client(http, base)
+        tokens = await obtain_tokens(http, base, client_id)
+
+        first, second = await asyncio.gather(
+            _refresh(http, base, client_id, tokens["refresh_token"]),
+            _refresh(http, base, client_id, tokens["refresh_token"]),
+        )
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+
+        # Every pair handed out is independently usable: the client may keep
+        # whichever response it stored last.
+        for pair in (first.json(), second.json()):
+            r = await http.post(
+                f"{base}/mcp",
+                json=MCP_INIT,
+                headers={**MCP_HEADERS, "Authorization": f"Bearer {pair['access_token']}"},
+            )
+            assert r.status_code == 200
+            r = await _refresh(http, base, client_id, pair["refresh_token"])
+            assert r.status_code == 200, r.text
+
+
+async def test_rotated_refresh_token_dies_after_grace_window(gateway):
+    server, app = gateway
+    base = server.base_url
+    storage = app.state.storage
+    async with httpx.AsyncClient() as http:
+        client_id = await register_client(http, base)
+        tokens = await obtain_tokens(http, base, client_id)
+
+        r = await _refresh(http, base, client_id, tokens["refresh_token"])
+        assert r.status_code == 200
+
+        # A rotated token only lives for the grace window, not its original
+        # 30-day lifetime -- and a reuse inside the window doesn't extend it.
+        old = storage.get_refresh_token(tokens["refresh_token"])
+        grace = app.state.config.auth.refresh_token_reuse_grace_seconds
+        assert old is not None
+        assert old["expires_at"] <= time.time() + grace
+        r = await _refresh(http, base, client_id, tokens["refresh_token"])
+        assert r.status_code == 200
+        assert storage.get_refresh_token(tokens["refresh_token"])["expires_at"] == old["expires_at"]
+
+        # Simulate the window elapsing.
+        with storage._lock:
+            storage._conn.execute(
+                "UPDATE refresh_tokens SET expires_at=? WHERE token_hash=?",
+                (time.time() - 1, token_hash(tokens["refresh_token"])),
+            )
+            storage._conn.commit()
+        r = await _refresh(http, base, client_id, tokens["refresh_token"])
+        assert r.status_code in (400, 401)
+
+
+async def test_revoked_refresh_token_gets_no_grace(base):
+    """Explicit revocation (RFC 7009) is immediate; the grace window only
+    applies to rotation."""
+    async with httpx.AsyncClient() as http:
+        client_id = await register_client(http, base)
+        tokens = await obtain_tokens(http, base, client_id)
+
+        r = await http.post(
+            f"{base}/revoke",
+            # client_secret must be present (may be empty) per the SDK's
+            # request model, even for public clients.
+            data={
+                "token": tokens["refresh_token"],
+                "token_type_hint": "refresh_token",
+                "client_id": client_id,
+                "client_secret": "",
+            },
+        )
+        assert r.status_code == 200
+        r = await _refresh(http, base, client_id, tokens["refresh_token"])
+        assert r.status_code in (400, 401)
 
 
 async def test_denied_consent_returns_access_denied(base):

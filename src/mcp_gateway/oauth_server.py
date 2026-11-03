@@ -314,6 +314,15 @@ class GatewayOAuthProvider(OAuthProvider):
     ) -> RefreshToken | None:
         data = self.storage.get_refresh_token(refresh_token)
         if data is None or data["client_id"] != client.client_id:
+            # The SDK turns this into a bare invalid_grant; log it, since for
+            # the client it usually means a dead connector until the user
+            # re-authorizes, and nothing else would show why.
+            logger.warning(
+                "Rejected refresh token from client %s: unknown, expired, revoked, "
+                "rotated more than %ds ago, or issued to another client",
+                client.client_id,
+                self.config.auth.refresh_token_reuse_grace_seconds,
+            )
             return None
         return RefreshToken(
             token=refresh_token,
@@ -332,11 +341,25 @@ class GatewayOAuthProvider(OAuthProvider):
         data = self.storage.get_refresh_token(refresh_token.token)
         if data is None or data["client_id"] != client.client_id:
             raise TokenError(error="invalid_grant", error_description="Invalid refresh token")
-        # Rotation (OAuth 2.1 requirement for public clients): the old refresh
-        # token is revoked and a fresh access/refresh pair is issued.
-        self.storage.revoke_refresh_token(refresh_token.token)
+        # Rotation (OAuth 2.1 requirement for public clients): a fresh
+        # access/refresh pair is issued and the old refresh token retired --
+        # after a short grace window rather than instantly. Clients such as
+        # Claude share one connector's credentials across several surfaces
+        # and can refresh concurrently; with instant revocation the losing
+        # request gets invalid_grant and the client drops the connector's
+        # tool list until it's manually refreshed. Same idea as Okta's/Auth0's
+        # refresh token reuse interval.
+        grace = self.config.auth.refresh_token_reuse_grace_seconds
+        if self.storage.rotate_refresh_token(refresh_token.token, grace):
+            logger.debug("Rotating refresh token for client %s", client.client_id)
+        else:
+            logger.info(
+                "Refresh token for client %s reused within the %ds grace window "
+                "(concurrent or retried refresh); issuing another token pair",
+                client.client_id,
+                grace,
+            )
         effective_scopes = scopes or data["scopes"]
-        logger.debug("Rotating refresh token for client %s", client.client_id)
         return self._issue_tokens(
             client_id=client.client_id,
             scopes=effective_scopes,
