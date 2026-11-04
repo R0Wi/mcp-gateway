@@ -30,12 +30,20 @@ from __future__ import annotations
 
 import time
 
+import httpx2
 import pytest
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from mcp.shared.auth import (
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthMetadata,
+    OAuthToken,
+    ProtectedResourceMetadata,
+)
 from pydantic import AnyUrl
 
+from mcp_gateway.config import GatewayConfig
 from mcp_gateway.storage import Storage
-from mcp_gateway.upstream import DbTokenStorage, JsonTokenOAuthClientProvider
+from mcp_gateway.upstream import BackendManager, DbTokenStorage, JsonTokenOAuthClientProvider
 
 # A GitHub App user-to-server token response (refreshing-user-access-tokens
 # doc): expires in 8h, ships a refresh token good for ~6 months.
@@ -216,3 +224,133 @@ async def test_non_expiring_classic_oauth_app_token_has_no_expiry(storage):
     assert provider.context.token_expiry_time is None
     assert provider.context.is_token_valid()
     assert not provider.context.can_refresh_token()
+
+
+# --- persisted OAuth metadata (wrong-URL refresh after restart) -------------
+
+GITHUB_TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
+
+
+def github_metadata() -> OAuthMetadata:
+    return OAuthMetadata(
+        issuer="https://github.com/login/oauth",
+        authorization_endpoint="https://github.com/login/oauth/authorize",
+        token_endpoint=GITHUB_TOKEN_ENDPOINT,
+    )
+
+
+def set_discovered_metadata(provider: JsonTokenOAuthClientProvider) -> None:
+    provider.context.oauth_metadata = github_metadata()
+    provider.context.auth_server_url = "https://github.com/login/oauth"
+    provider.context.protected_resource_metadata = ProtectedResourceMetadata(
+        resource="https://api.githubcopilot.com/mcp/",
+        authorization_servers=[AnyUrl("https://github.com/login/oauth")],
+    )
+
+
+def json_response(body: dict) -> httpx2.Response:
+    return httpx2.Response(200, json=body)
+
+
+async def test_token_response_persists_auth_metadata(storage):
+    provider = make_provider(storage)
+    await provider._initialize()
+    set_discovered_metadata(provider)
+
+    await provider._handle_token_response(json_response(GITHUB_APP_TOKEN_RESPONSE))
+
+    stored = storage.get_upstream("github", "auth_metadata")
+    assert stored["oauth_metadata"]["token_endpoint"] == GITHUB_TOKEN_ENDPOINT
+    assert stored["auth_server_url"] == "https://github.com/login/oauth"
+    assert stored["protected_resource_metadata"]["resource"] == "https://api.githubcopilot.com/mcp/"
+
+
+async def test_refresh_response_persists_auth_metadata(storage):
+    token_storage = DbTokenStorage(storage, "github")
+    await token_storage.set_tokens(OAuthToken.model_validate(GITHUB_APP_TOKEN_RESPONSE))
+    provider = make_provider(storage)
+    await provider._initialize()
+    set_discovered_metadata(provider)
+
+    assert await provider._handle_refresh_response(json_response(GITHUB_APP_TOKEN_RESPONSE)) is True
+    stored = storage.get_upstream("github", "auth_metadata")
+    assert stored["oauth_metadata"]["token_endpoint"] == GITHUB_TOKEN_ENDPOINT
+
+
+async def test_failed_refresh_does_not_persist_metadata(storage):
+    provider = make_provider(storage)
+    await provider._initialize()
+    set_discovered_metadata(provider)
+
+    assert await provider._handle_refresh_response(httpx2.Response(404)) is False
+    assert storage.get_upstream("github", "auth_metadata") is None
+
+
+async def test_refresh_after_restart_uses_stored_token_endpoint(storage):
+    """Regression: after a restart the proactive refresh used to go to
+    <server origin>/token (https://api.githubcopilot.com/token -> 404)."""
+    first = make_provider(storage)
+    await first._initialize()
+    set_discovered_metadata(first)
+    await first._handle_token_response(json_response(GITHUB_APP_TOKEN_RESPONSE))
+    await register_client_info(first.context.storage)
+    backdate_expiry(storage, "github", time.time() - 1000)
+
+    restarted = make_provider(storage)
+    await restarted._initialize()
+
+    assert restarted.context.oauth_metadata is not None
+    assert restarted.context.auth_server_url == "https://github.com/login/oauth"
+    assert restarted.context.protected_resource_metadata is not None
+    assert not restarted.context.is_token_valid()
+    request = await restarted._refresh_token()
+    assert str(request.url) == GITHUB_TOKEN_ENDPOINT
+    assert str(request.url) != "https://api.githubcopilot.com/token"
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {"oauth_metadata": {"nonsense": True}},
+        {"oauth_metadata": github_metadata().model_dump(mode="json"), "auth_server_url": 5},
+        {"oauth_metadata": github_metadata().model_dump(mode="json"),
+         "protected_resource_metadata": {"bad": 1}},
+        {"unexpected": "shape"},
+    ],
+)
+async def test_invalid_stored_metadata_is_ignored(storage, stored):
+    storage.save_upstream("github", "auth_metadata", stored)
+    provider = make_provider(storage)
+    await provider._initialize()
+    assert provider.context.oauth_metadata is None
+    assert provider.context.protected_resource_metadata is None
+    assert provider.context.auth_server_url is None
+
+
+async def test_disconnect_clears_stored_and_in_memory_metadata(storage):
+    config = GatewayConfig.model_validate(
+        {
+            "server": {"public_url": "http://127.0.0.1:1", "port": 1},
+            "auth": {"encryption_key": "test-passphrase", "users": []},
+            "storage": {"path": ":memory:"},
+            "backends": {
+                "github": {
+                    "url": "https://api.githubcopilot.com/mcp/",
+                    "auth": {"type": "oauth", "client_id": "test-client-id"},
+                }
+            },
+        }
+    )
+    manager = BackendManager(config, storage)
+    provider = manager._build_oauth_provider("github", config.backends["github"])
+    await provider._initialize()
+    set_discovered_metadata(provider)
+    await provider._handle_token_response(json_response(GITHUB_APP_TOKEN_RESPONSE))
+    assert storage.get_upstream("github", "auth_metadata") is not None
+
+    manager.disconnect("github")
+
+    assert storage.get_upstream("github", "auth_metadata") is None
+    assert provider.context.oauth_metadata is None
+    assert provider.context.protected_resource_metadata is None
+    assert provider.context.auth_server_url is None
