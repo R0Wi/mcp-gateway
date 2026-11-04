@@ -40,7 +40,9 @@ from mcp.shared.auth import (
     AuthorizationCodeResult,
     OAuthClientInformationFull,
     OAuthClientMetadata,
+    OAuthMetadata,
     OAuthToken,
+    ProtectedResourceMetadata,
 )
 from pydantic import AnyUrl
 
@@ -158,6 +160,71 @@ class JsonTokenOAuthClientProvider(OAuthClientProvider):
         await super()._initialize()
         if self.context.current_tokens is not None:
             self.context.update_token_expiry(self.context.current_tokens)
+        await self._restore_auth_metadata()
+
+    async def _restore_auth_metadata(self) -> None:
+        """Restore discovered OAuth metadata persisted by a previous process.
+
+        ``context.oauth_metadata`` (plus ``protected_resource_metadata`` and
+        ``auth_server_url``) is in memory only. The SDK's proactive refresh runs
+        *before* any discovery, and without ``oauth_metadata`` it falls back to
+        ``<server origin>/token`` -- a 404 on e.g. ``api.githubcopilot.com`` --
+        so the first refresh after every restart fails and the request that
+        triggered it loses the backend's tools. Metadata is therefore saved on
+        every successful token exchange/refresh and reloaded here. Stale or
+        unreadable data is ignored: the refresh then fails as it did before,
+        the 401 path rediscovers, and the next exchange overwrites the copy.
+        """
+        if self.context.oauth_metadata is not None:
+            return
+        storage = self.context.storage
+        if not isinstance(storage, DbTokenStorage):
+            return
+        try:
+            data = storage.get_auth_metadata()
+            if not data:
+                return
+            oauth_metadata = OAuthMetadata.model_validate(data["oauth_metadata"])
+            prm = data.get("protected_resource_metadata")
+            protected = ProtectedResourceMetadata.model_validate(prm) if prm else None
+            auth_server_url = data.get("auth_server_url")
+            if auth_server_url is not None and not isinstance(auth_server_url, str):
+                raise ValueError("auth_server_url is not a string")
+        except Exception as exc:  # noqa: BLE001 - metadata is a best-effort cache
+            logger.debug("Ignoring stored OAuth metadata that failed to restore: %s", exc)
+            return
+        self.context.oauth_metadata = oauth_metadata
+        self.context.protected_resource_metadata = protected
+        self.context.auth_server_url = auth_server_url
+        logger.debug(
+            "Restored OAuth metadata (token endpoint %s)", oauth_metadata.token_endpoint
+        )
+
+    def _persist_auth_metadata(self) -> None:
+        storage = self.context.storage
+        if self.context.oauth_metadata is None or not isinstance(storage, DbTokenStorage):
+            return
+        prm = self.context.protected_resource_metadata
+        try:
+            storage.set_auth_metadata(
+                {
+                    "oauth_metadata": self.context.oauth_metadata.model_dump(mode="json"),
+                    "auth_server_url": self.context.auth_server_url,
+                    "protected_resource_metadata": prm.model_dump(mode="json") if prm else None,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail an exchange over a cache write
+            logger.debug("Could not persist OAuth metadata: %s", exc)
+
+    async def _handle_token_response(self, response: httpx2.Response) -> None:
+        await super()._handle_token_response(response)
+        self._persist_auth_metadata()
+
+    async def _handle_refresh_response(self, response: httpx2.Response) -> bool:
+        ok = await super()._handle_refresh_response(response)
+        if ok:
+            self._persist_auth_metadata()
+        return ok
 
 
 class DbTokenStorage(TokenStorage):
@@ -198,6 +265,13 @@ class DbTokenStorage(TokenStorage):
             return self._static_client_info
         data = self._storage.get_upstream(self._backend, "client_info")
         return OAuthClientInformationFull.model_validate(data) if data else None
+
+    def get_auth_metadata(self) -> dict[str, Any] | None:
+        """Discovered OAuth metadata (AS + protected resource), if persisted."""
+        return self._storage.get_upstream(self._backend, "auth_metadata")
+
+    def set_auth_metadata(self, data: dict[str, Any]) -> None:
+        self._storage.save_upstream(self._backend, "auth_metadata", data)
 
     async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
         if self._static_client_info is not None:
@@ -557,6 +631,10 @@ class BackendManager:
         if provider is not None:
             provider.context.clear_tokens()
             provider.context.client_info = None
+            # Force rediscovery on reconnect.
+            provider.context.oauth_metadata = None
+            provider.context.protected_resource_metadata = None
+            provider.context.auth_server_url = None
             provider._initialized = False
 
     # ------------------------------------------------------------- status
