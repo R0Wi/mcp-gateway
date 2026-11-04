@@ -44,10 +44,8 @@ building from source is only needed if you want to change the code.
 - **Protected Resource Metadata** (RFC 9728); 401 responses carry
   `WWW-Authenticate: Bearer resource_metadata="…"` as Claude's connector requires
 - Resource indicators (RFC 8707) accepted and bound to issued tokens
-- Short-lived opaque access tokens, **rotating refresh tokens** (with a short reuse
-  grace window, `refresh_token_reuse_grace_seconds`, so concurrent or retried
-  refreshes don't break the connection), single-use authorization codes — all
-  stored **hashed**; client records encrypted at rest
+- Short-lived opaque access tokens, **rotating refresh tokens**, single-use
+  authorization codes — all stored **hashed**; client records encrypted at rest
 - Loopback redirect URIs match **port-agnostically** (Claude Code CLI registers one
   port and authorizes with another); non-loopback URIs require exact registration
 - Small **Svelte 5** login + consent UI (single local identity from the config file)
@@ -118,6 +116,15 @@ uses its CIMD client ID), and opens your browser: log in with a user from
 
 Add `https://mcp.example.com/mcp` as a custom connector. The browser redirect to
 `https://claude.ai/api/mcp/auth_callback` goes through the same login/consent flow.
+
+> **Connector tool list goes empty after a few days?** Claude connects with the
+> sessionless `2026-07-28` MCP protocol, which the gateway serves since the FastMCP 4
+> upgrade. Older images (FastMCP 3 / MCP SDK 1.x) reject Claude's opening request with
+> `400`, push it onto long-lived handshake sessions that never expire, and eventually
+> answer one of those with a `400` Claude doesn't recover from — the connector then
+> lists no tools until **Refresh tool list** is clicked. Run a current image; in the
+> logs, `POST /mcp … 400` from Claude's addresses with no `Created new transport`
+> line just before it is the signature.
 
 ### Connect OAuth backends
 

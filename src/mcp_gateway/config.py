@@ -104,13 +104,6 @@ class AuthConfig(BaseModel):
     session_secret: str | None = None
     access_token_expiry_seconds: int = 3600
     refresh_token_expiry_seconds: int = 60 * 60 * 24 * 30
-    # Refresh tokens rotate on every use. For this many seconds after a
-    # rotation the old refresh token is still honoured (each reuse yields
-    # another fresh pair), so a client that refreshes concurrently -- e.g.
-    # several Claude surfaces sharing one connector's credentials -- or retries
-    # a refresh whose response was lost doesn't get invalid_grant and silently
-    # lose the connector's tools. 0 = strict single use.
-    refresh_token_reuse_grace_seconds: int = Field(default=60, ge=0)
     authorization_code_expiry_seconds: int = 300
     login_session_expiry_seconds: int = 60 * 60 * 8
     # Optional allow-list of redirect URI patterns for dynamically registered /

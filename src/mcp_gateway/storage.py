@@ -425,31 +425,6 @@ class Storage:
             "expires_at": row[4],
         }
 
-    def rotate_refresh_token(self, token: str, grace_seconds: int) -> bool:
-        """Retire a refresh token that has just been exchanged for a new pair.
-
-        With ``grace_seconds <= 0`` the token is revoked outright. Otherwise its
-        expiry is pulled in to ``now + grace_seconds``, so the *same* token can
-        still be exchanged during that window: a client that refreshes twice
-        concurrently, or retries a refresh whose response it never received,
-        then gets a fresh pair instead of ``invalid_grant`` and a dead
-        connector (see ``auth.refresh_token_reuse_grace_seconds``).
-
-        Returns ``False`` when the token had already been rotated, i.e. this
-        exchange is a reuse within the grace window.
-        """
-        if grace_seconds <= 0:
-            self.revoke_refresh_token(token)
-            return True
-        deadline = time.time() + grace_seconds
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE refresh_tokens SET expires_at=? WHERE token_hash=? AND expires_at>?",
-                (deadline, token_hash(token), deadline),
-            )
-            self._conn.commit()
-        return cur.rowcount > 0
-
     def revoke_refresh_token(self, token: str) -> None:
         with self._lock:
             self._conn.execute(
