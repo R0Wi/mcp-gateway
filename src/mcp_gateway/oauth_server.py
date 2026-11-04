@@ -314,6 +314,14 @@ class GatewayOAuthProvider(OAuthProvider):
     ) -> RefreshToken | None:
         data = self.storage.get_refresh_token(refresh_token)
         if data is None or data["client_id"] != client.client_id:
+            # The SDK turns this into a bare invalid_grant; log it, since for
+            # the client it usually means a dead connector until the user
+            # re-authorizes, and nothing else would show why.
+            logger.warning(
+                "Rejected refresh token from client %s: unknown, expired, revoked "
+                "(already rotated) or issued to another client",
+                client.client_id,
+            )
             return None
         return RefreshToken(
             token=refresh_token,

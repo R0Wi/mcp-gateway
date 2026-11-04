@@ -13,6 +13,8 @@ session, regardless of that setting.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import httpx2
 import pytest
@@ -22,6 +24,7 @@ from mcp_types.version import LATEST_HANDSHAKE_VERSION, LATEST_MODERN_VERSION
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
+from mcp_gateway import app as app_module
 from mcp_gateway.app import create_app
 from tests.conftest import free_port, gateway_config, obtain_tokens, register_client
 
@@ -118,6 +121,10 @@ async def test_client_eras_reach_modern_and_legacy_backends(
 
     session_ids = {r.headers.get("mcp-session-id") for r in responses} - {None}
     assert bool(session_ids) is sessionful
+    # Not even a rejected probe on the way: the pre-FastMCP-4 gateway answered
+    # every modern client's opening server/discover with 400 and only worked
+    # because the client fell back to the handshake.
+    assert [r.status_code for r in responses if r.status_code >= 400] == []
 
     # Backend legs negotiate independently of the front: the modern backend
     # is only ever spoken to sessionlessly, the legacy-only one falls back to
@@ -178,3 +185,61 @@ async def test_connection_test_probes_each_backend_era(stack):
             details[name] = r.text
     assert f"Connected (protocol {LATEST_MODERN_VERSION})" in details["modern"]
     assert f"Ping succeeded (protocol {LATEST_HANDSHAKE_VERSION})" in details["legacy"]
+
+
+async def test_idle_handshake_session_is_reaped_with_404(run_server, monkeypatch):
+    """A handshake-era session must not live forever, and a request on one that
+    has been reaped must get 404 -- the spec's "re-initialize" signal.
+
+    Regression for the empty-tool-list bug: on the pre-FastMCP-4 stack
+    sessions never expired, Claude kept reusing days-old ones, and once such a
+    request was answered with 400 instead, Claude showed the connector with no
+    tools until "Refresh tool list" was clicked.
+    """
+    monkeypatch.setattr(app_module, "MCP_SESSION_IDLE_TIMEOUT_SECONDS", 1)
+    port = free_port()
+    base = run_server(create_app(gateway_config(port)), port).base_url
+    async with httpx.AsyncClient() as http:
+        client_id = await register_client(http, base)
+        token = (await obtain_tokens(http, base, client_id))["access_token"]
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {token}",
+        }
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": LATEST_HANDSHAKE_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "0"},
+            },
+        }
+        r = await http.post(f"{base}/mcp", headers=headers, json=initialize)
+        assert r.status_code == 200, r.text
+        session = {
+            **headers,
+            "Mcp-Session-Id": r.headers["mcp-session-id"],
+            "MCP-Protocol-Version": LATEST_HANDSHAKE_VERSION,
+        }
+        r = await http.post(
+            f"{base}/mcp",
+            headers=session,
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        assert r.status_code == 202
+        list_tools = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        r = await http.post(f"{base}/mcp", headers=session, json=list_tools)
+        assert r.status_code == 200
+        assert "gateway_status" in r.text
+
+        # Any request on the session counts as activity, so wait it out once
+        # rather than polling.
+        await asyncio.sleep(2.5)
+        r = await http.post(f"{base}/mcp", headers=session, json=list_tools)
+        assert r.status_code == 404, r.text
+
+        # ...and re-initializing, as the client is then supposed to, works.
+        r = await http.post(f"{base}/mcp", headers=headers, json=initialize)
+        assert r.status_code == 200, r.text

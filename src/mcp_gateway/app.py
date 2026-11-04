@@ -39,6 +39,16 @@ _fastmcp_logger.propagate = True
 # reclaimed on this interval, not just at startup.
 PURGE_INTERVAL_SECONDS = 15 * 60
 
+# Handshake-era (initialize + Mcp-Session-Id) MCP sessions are reaped after
+# this much inactivity; a later request on a reaped session gets 404, the
+# spec's signal for the client to re-initialize. Pinned here rather than left
+# to the SDK default: on the pre-FastMCP-4 stack sessions never expired, and
+# Claude kept reusing days-old sessions until one was answered with a 400
+# instead -- which it does not recover from, so the connector showed an empty
+# tool list until "Refresh tool list" was clicked. Modern (2026-07-28)
+# clients are sessionless and unaffected.
+MCP_SESSION_IDLE_TIMEOUT_SECONDS = 30 * 60
+
 # Anonymous, expensive endpoints: bounded per source IP. Login is also
 # offloaded to a thread (see web.py) so a flood can't stall the whole
 # server, but the limiter is what actually blunts credential guessing and
@@ -79,7 +89,7 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
     mcp = build_gateway(config, provider, manager, clients)
     # The MCP endpoint lives at <public_url>/mcp; auth + well-known routes sit
     # at the root of the same app per RFC 8414/9728.
-    mcp_app = mcp.http_app(path="/mcp")
+    mcp_app = mcp.http_app(path="/mcp", session_idle_timeout=MCP_SESSION_IDLE_TIMEOUT_SECONDS)
 
     async def _purge_loop() -> None:
         while True:
