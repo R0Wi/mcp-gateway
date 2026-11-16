@@ -70,6 +70,11 @@ building from source is only needed if you want to change the code.
   `msdocs_microsoft_docs_search`, …
 - Live proxying over Streamable HTTP; a down or not-yet-connected backend only
   removes its own tools instead of breaking the gateway
+- **Both MCP protocol eras** on the one `/mcp` endpoint, negotiated per connection: the
+  sessionless `2026-07-28` protocol (no `Mcp-Session-Id`; every request stands on its
+  own) and the handshake-era versions up to `2025-11-25` (`initialize` + session).
+  Backends are negotiated independently the same way, so modern clients reach
+  handshake-only backends and vice versa
 - Built-in `gateway_status` tool
 
 ## Quick start
@@ -113,6 +118,15 @@ uses its CIMD client ID), and opens your browser: log in with a user from
 
 Add `https://mcp.example.com/mcp` as a custom connector. The browser redirect to
 `https://claude.ai/api/mcp/auth_callback` goes through the same login/consent flow.
+
+> **Connector tool list goes empty after a few days?** Claude connects with the
+> sessionless `2026-07-28` MCP protocol, which the gateway serves since the FastMCP 4
+> upgrade. Older images (FastMCP 3 / MCP SDK 1.x) reject Claude's opening request with
+> `400`, push it onto long-lived handshake sessions that never expire, and eventually
+> answer one of those with a `400` Claude doesn't recover from — the connector then
+> lists no tools until **Refresh tool list** is clicked. Run a current image; in the
+> logs, `POST /mcp … 400` from Claude's addresses with no `Created new transport`
+> line just before it is the signature.
 
 ### Connect clients without DCR/CIMD (e.g. Gemini Enterprise)
 

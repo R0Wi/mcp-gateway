@@ -10,17 +10,22 @@ listing instead of breaking the whole gateway.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import dataclasses
 import functools
 import logging
+import time
 
 from fastmcp import Client, FastMCP
+from fastmcp.client.transports.base import TransportOptions
 from fastmcp.server import create_proxy
-from mcp.types import Icon, ToolAnnotations
+from fastmcp.server.middleware import Middleware
+from mcp.types import DiscoverResult, Icon, ToolAnnotations
 
 from mcp_gateway.config import GatewayConfig
 from mcp_gateway.oauth_server import GatewayOAuthProvider
-from mcp_gateway.upstream import BackendManager
+from mcp_gateway.upstream import BackendManager, NoForwardStreamableHttpTransport
 from mcp_gateway.web import STATIC_DIR
 
 logger = logging.getLogger(__name__)
@@ -45,7 +50,126 @@ def _server_icons() -> list[Icon]:
         logger.debug("Favicon not found at %s; MCP server will advertise no icon", _FAVICON_PATH)
         return []
     data_uri = "data:image/svg+xml;base64," + base64.b64encode(svg).decode("ascii")
-    return [Icon(src=data_uri, mimeType="image/svg+xml")]
+    return [Icon(src=data_uri, mime_type="image/svg+xml")]
+
+
+def _require_no_header_forwarding(name: str, client: Client) -> None:
+    """Refuse to start unless `client` can't pass the caller's token upstream.
+
+    FastMCP proxies forward the inbound request's headers (Authorization
+    included) to the backend by default. That is token passthrough, which the
+    MCP authorization spec explicitly forbids, and the single most important
+    invariant in the gateway. ``NoForwardStreamableHttpTransport`` turns it
+    off by overriding ``TransportOptions.forward_incoming_headers``; fail
+    startup loudly if a backend client bypasses that transport, or if a future
+    fastmcp release renames or removes the option -- either would re-enable
+    passthrough (or break every backend call) with no error at startup.
+    """
+    transport = getattr(client, "transport", None)
+    if not isinstance(transport, NoForwardStreamableHttpTransport):
+        raise TypeError(
+            f"Backend {name!r}: transport {type(transport).__name__} is not "
+            "NoForwardStreamableHttpTransport; cannot guarantee the "
+            "no-token-passthrough invariant."
+        )
+    if "forward_incoming_headers" not in {f.name for f in dataclasses.fields(TransportOptions)}:
+        raise RuntimeError(
+            "fastmcp's TransportOptions has no 'forward_incoming_headers' field; "
+            "cannot guarantee the no-token-passthrough invariant. This likely "
+            "means the installed fastmcp version changed its proxy transport API."
+        )
+
+
+class BackendInstructionsMiddleware(Middleware):
+    """Append every backend's own server ``instructions`` to the gateway's.
+
+    fastmcp forwards a proxied backend's instructions only when the proxy is
+    the root server (``ProxyMetadataMiddleware``). Mounted under the gateway,
+    that middleware never runs, and the gateway sets its own instructions
+    anyway, so without this the guidance a backend ships for its model would
+    be silently dropped. Each backend's text goes in its own section, headed by
+    the namespace its tools were mounted under, since the text refers to the
+    backend's un-prefixed tool names.
+
+    Works for both protocol eras: ``initialize`` (handshake) and
+    ``server/discover`` (sessionless ``2026-07-28``). Discover can arrive on
+    every client connection, so results are cached for ``ttl`` seconds, and
+    backends that couldn't be read (down, OAuth not connected yet, slow) are
+    retried after only ``failure_ttl``. A backend never delays or fails the
+    gateway's own handshake by more than ``timeout`` seconds.
+    """
+
+    def __init__(
+        self,
+        clients: dict[str, Client],
+        *,
+        ttl: float = 300.0,
+        failure_ttl: float = 30.0,
+        timeout: float = 5.0,
+    ) -> None:
+        self._clients = clients
+        self._ttl = ttl
+        self._failure_ttl = failure_ttl
+        self._timeout = timeout
+        # name -> (instructions or None, monotonic expiry)
+        self._cache: dict[str, tuple[str | None, float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def _read(self, name: str, client: Client) -> tuple[str | None, bool]:
+        """Return ``(instructions, ok)`` read from a fresh session to the backend."""
+
+        async def read() -> str | None:
+            # A separate client instance: never touch the proxy's own sessions.
+            fresh = client.new()
+            async with fresh:
+                return fresh.instructions
+
+        try:
+            return await asyncio.wait_for(read(), timeout=self._timeout), True
+        except Exception as exc:  # noqa: BLE001 - one backend must not break initialize
+            logger.debug(
+                "Backend %s: could not read server instructions: %s: %s",
+                name,
+                type(exc).__name__,
+                exc,
+            )
+            return None, False
+
+    async def _backend_instructions(self) -> dict[str, str]:
+        async with self._lock:
+            now = time.monotonic()
+            stale = [n for n in self._clients if self._cache.get(n, (None, 0.0))[1] <= now]
+            if stale:
+                results = await asyncio.gather(*(self._read(n, self._clients[n]) for n in stale))
+                now = time.monotonic()
+                for name, (text, ok) in zip(stale, results, strict=True):
+                    self._cache[name] = (text, now + (self._ttl if ok else self._failure_ttl))
+            return {
+                name: text.strip()
+                for name in self._clients
+                if (text := self._cache[name][0]) and text.strip()
+            }
+
+    async def _merged(self, base: str | None) -> str | None:
+        sections = [
+            f"## Backend `{name}` (its tools are exposed with the prefix `{name}_`)\n\n{text}"
+            for name, text in (await self._backend_instructions()).items()
+        ]
+        if not sections:
+            return base
+        return "\n\n".join([base, *sections] if base else sections)
+
+    async def on_initialize(self, context, call_next):
+        result = await call_next(context)
+        if result is None:
+            return None
+        return result.model_copy(update={"instructions": await self._merged(result.instructions)})
+
+    async def on_discover(self, context, call_next):
+        result = await call_next(context)
+        if not isinstance(result, DiscoverResult):
+            return result
+        return result.model_copy(update={"instructions": await self._merged(result.instructions)})
 
 
 def build_gateway(
@@ -85,42 +209,28 @@ def build_gateway(
         name="gateway_status",
         annotations=ToolAnnotations(
             title="Gateway Status",
-            readOnlyHint=True,
-            openWorldHint=False
+            read_only_hint=True,
+            open_world_hint=False
         ),
-        icons=[Icon(src=_status_icon_data_uri, mimeType="image/svg+xml")]
+        icons=[Icon(src=_status_icon_data_uri, mime_type="image/svg+xml")]
     )
     def gateway_status() -> list[dict]:
         """List the backends configured in this gateway and their connection state."""
         logger.debug("gateway_status tool invoked")
         return manager.backend_status()
 
+    mounted: dict[str, Client] = {}
     for name, backend in config.backends.items():
         if not backend.enabled:
             logger.info("Backend %s is disabled; skipping", name)
             continue
+        _require_no_header_forwarding(name, clients[name])
         proxy = create_proxy(clients[name], name=f"proxy-{name}", mask_error_details=True)
-        # FastMCP proxies forward the inbound Authorization header upstream by
-        # default. That is token passthrough, which the MCP authorization spec
-        # explicitly forbids: the gateway token issued to the MCP client must
-        # never reach a backend. Backends only ever see credentials the
-        # gateway itself holds (static headers or its own upstream OAuth tokens).
-        #
-        # This is the single most important invariant in the gateway, so fail
-        # startup loudly rather than silently no-op if a future fastmcp
-        # release renames or removes the attribute -- a silent no-op here
-        # would re-enable token passthrough with no error and no test
-        # failure to catch it.
-        transport = getattr(clients[name], "transport", None)
-        if not hasattr(transport, "forward_incoming_headers"):
-            raise RuntimeError(
-                f"Backend {name!r}: transport {type(transport).__name__} has no "
-                "'forward_incoming_headers' attribute; cannot guarantee the "
-                "no-token-passthrough invariant. This likely means the "
-                "installed fastmcp version changed its proxy transport API."
-            )
-        transport.forward_incoming_headers = False
         mcp.mount(proxy, namespace=name)
+        mounted[name] = clients[name]
         logger.info("Mounted backend %s (%s, auth=%s)", name, backend.url, backend.auth.type)
+
+    if mounted:
+        mcp.add_middleware(BackendInstructionsMiddleware(mounted))
 
     return mcp

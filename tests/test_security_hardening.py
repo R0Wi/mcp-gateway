@@ -351,26 +351,11 @@ def test_mask_error_details_enabled():
     assert mcp._mask_error_details is True
 
 
-def test_forward_incoming_headers_missing_attribute_fails_loudly(monkeypatch):
-    """If a future fastmcp release renames/removes forward_incoming_headers,
-    the gateway must refuse to start rather than silently re-enabling token
-    passthrough to backends.
-
-    fastmcp's own create_proxy() defensively re-sets this attribute on a
-    plain Client's StreamableHttpTransport/SSETransport, so a real client
-    always has it today -- that's a second line of defense, not this one.
-    To exercise *our* check in isolation, create_proxy is stubbed out here
-    so only gateway.py's own hasattr check decides the outcome.
-    """
-    from fastmcp import Client
-    from fastmcp.client.transports import StreamableHttpTransport
-
+def _build_gateway_with_client(client):
     import mcp_gateway.gateway as gateway_module
     from mcp_gateway.oauth_server import GatewayOAuthProvider
     from mcp_gateway.storage import Storage
     from mcp_gateway.upstream import BackendManager
-
-    monkeypatch.setattr(gateway_module, "create_proxy", lambda *a, **k: object())
 
     port = free_port()
     config = gateway_config(
@@ -379,9 +364,39 @@ def test_forward_incoming_headers_missing_attribute_fails_loudly(monkeypatch):
     storage = Storage(":memory:", config.auth.encryption_key)
     provider = GatewayOAuthProvider(config, storage)
     manager = BackendManager(config, storage)
+    return gateway_module.build_gateway(config, provider, manager, {"x": client})
+
+
+def test_plain_transport_backend_client_fails_loudly():
+    """fastmcp proxies forward the inbound Authorization header upstream unless
+    the transport overrides it; a backend client built on a plain
+    StreamableHttpTransport would silently re-enable token passthrough, so the
+    gateway must refuse to start with one."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
 
     client = Client(StreamableHttpTransport("http://127.0.0.1:1/mcp"))
-    del client.transport.forward_incoming_headers  # simulate a fastmcp API change
+    with pytest.raises(TypeError, match="no-token-passthrough"):
+        _build_gateway_with_client(client)
 
+
+def test_forward_incoming_headers_missing_option_fails_loudly(monkeypatch):
+    """If a future fastmcp release renames/removes
+    TransportOptions.forward_incoming_headers, NoForwardStreamableHttpTransport's
+    override would stop meaning anything; the gateway must refuse to start
+    rather than find out at the first backend call (or not at all)."""
+    import dataclasses
+
+    from fastmcp import Client
+
+    import mcp_gateway.gateway as gateway_module
+    from mcp_gateway.upstream import NoForwardStreamableHttpTransport
+
+    @dataclasses.dataclass(frozen=True)
+    class RenamedTransportOptions:
+        forward_headers: bool = False  # simulate a fastmcp API change
+
+    monkeypatch.setattr(gateway_module, "TransportOptions", RenamedTransportOptions)
+    client = Client(NoForwardStreamableHttpTransport("http://127.0.0.1:1/mcp"))
     with pytest.raises(RuntimeError, match="forward_incoming_headers"):
-        gateway_module.build_gateway(config, provider, manager, {"x": client})
+        _build_gateway_with_client(client)

@@ -101,9 +101,17 @@ Request flow, root to leaf:
 ## Invariants and conventions to preserve
 
 - **No token passthrough.** The gateway token issued to an MCP client must never reach a
-  backend. `gateway.py` sets `transport.forward_incoming_headers = False` and *raises at
-  startup* if that attribute is missing — a fastmcp upgrade that renames it must be
-  handled, never worked around by deleting the check.
+  backend. FastMCP proxies force `TransportOptions.forward_incoming_headers=True` on
+  every backend connection; `upstream.py`'s `NoForwardStreamableHttpTransport` overrides
+  it back to `False` in `connect_session`, and `gateway.py` *raises at startup* if a
+  backend client uses any other transport or the option no longer exists — a fastmcp
+  upgrade that renames it must be handled, never worked around by deleting the check.
+- **Two MCP protocol eras.** FastMCP 4 / MCP SDK v2 serve the sessionless `2026-07-28`
+  protocol and the handshake era side by side, negotiated per connection, on both legs.
+  Lifecycle methods like `ping` don't exist in `2026-07-28` — check
+  `client.initialize_result is None` before using one (see `upstream.probe_backend`).
+  The SDK and FastMCP use `httpx2`, not `httpx`: an `httpx.Auth`/exception there
+  silently never matches.
 - **Single-instance by design.** SQLite, in-memory connect flows, and in-memory rate
   limiting all assume one process. Don't introduce work that only makes sense across
   replicas without saying so.

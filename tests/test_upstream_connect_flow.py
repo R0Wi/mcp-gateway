@@ -14,17 +14,17 @@ until the whole connect attempt times out:
   calls
 
 ``_drive_interactive_reauth`` wraps the provider in ``_ForcedChallengeAuth``,
-a thin ``httpx.Auth`` that relays request/response pairs between the
-provider's own generator and a real ``httpx.AsyncClient``, substituting a
+a thin ``httpx2.Auth`` that relays request/response pairs between the
+provider's own generator and a real ``httpx2.AsyncClient``, substituting a
 synthetic 401 for the probe's response unless the backend really did
-challenge. httpx itself then owns generator lifecycle, redirects, timeouts
+challenge. httpx2 itself then owns generator lifecycle, redirects, timeouts
 and response reads -- exactly the things a hand-rolled driver would have to
 get right on its own.
 
 The first two tests simulate the second case above: every real request the
 mock backend sees succeeds (never a 401), so the fix under test must be the
 one forcing the interactive path itself, not merely clearing the stored
-token. The rest pin httpx's own behavior through the wrapper: closing the
+token. The rest pin httpx2's own behavior through the wrapper: closing the
 generator on error/cancellation releases the lock ``async_auth_flow`` holds
 for its whole body, redirects are followed through discovery/registration/
 token endpoints, and the generator's very last step -- replaying the
@@ -36,9 +36,14 @@ from __future__ import annotations
 import asyncio
 from urllib.parse import parse_qs, urlparse
 
-import httpx
+import httpx2
 import pytest
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from mcp.shared.auth import (
+    AuthorizationCodeResult,
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthToken,
+)
 from pydantic import AnyUrl
 
 from mcp_gateway import upstream
@@ -85,9 +90,9 @@ def make_mock_backend_handler(mcp_path_calls: list[str] | None = None):
     to replay the generator's final step.
     """
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path.startswith("/.well-known/"):
-            return httpx.Response(404)
+            return httpx2.Response(404)
         if request.url.path == "/register":
             info = OAuthClientInformationFull(
                 client_id="dcr-client-id",
@@ -96,9 +101,9 @@ def make_mock_backend_handler(mcp_path_calls: list[str] | None = None):
                 response_types=["code"],
                 token_endpoint_auth_method="none",
             )
-            return httpx.Response(201, json=info.model_dump(mode="json"))
+            return httpx2.Response(201, json=info.model_dump(mode="json"))
         if request.url.path == "/token":
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "access_token": "at-from-interactive-flow",
@@ -110,7 +115,7 @@ def make_mock_backend_handler(mcp_path_calls: list[str] | None = None):
         if request.url.path == "/mcp/":
             if mcp_path_calls is not None:
                 mcp_path_calls.append(request.method)
-            return httpx.Response(200)
+            return httpx2.Response(200)
         raise AssertionError(f"unexpected request in test: {request.method} {request.url}")
 
     return handler
@@ -126,18 +131,18 @@ async def test_drive_interactive_reauth_completes_without_a_real_401(storage, mo
         captured["url"] = authorization_url
         captured["state"] = parse_qs(urlparse(authorization_url).query)["state"][0]
 
-    async def callback_handler() -> tuple[str, str | None]:
-        return "auth-code-123", captured["state"]
+    async def callback_handler() -> AuthorizationCodeResult:
+        return AuthorizationCodeResult(code="auth-code-123", state=captured["state"])
 
     provider = make_provider(storage, redirect_handler, callback_handler)
 
-    real_async_client = httpx.AsyncClient
+    real_async_client = httpx2.AsyncClient
 
     def fake_async_client(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(_mock_backend_handler)
+        kwargs["transport"] = httpx2.MockTransport(_mock_backend_handler)
         return real_async_client(*args, **kwargs)
 
-    monkeypatch.setattr(upstream.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(upstream.httpx2, "AsyncClient", fake_async_client)
 
     await _drive_interactive_reauth(provider)
 
@@ -174,19 +179,19 @@ async def test_drive_interactive_reauth_does_not_short_circuit_on_a_valid_stored
         redirected["called"] = True
         captured_url["url"] = authorization_url
 
-    async def callback_handler() -> tuple[str, str | None]:
+    async def callback_handler() -> AuthorizationCodeResult:
         state = parse_qs(urlparse(captured_url["url"]).query)["state"][0]
-        return "auth-code-456", state
+        return AuthorizationCodeResult(code="auth-code-456", state=state)
 
     provider = make_provider(storage, redirect_handler, callback_handler)
 
-    real_async_client = httpx.AsyncClient
+    real_async_client = httpx2.AsyncClient
 
     def fake_async_client(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(_mock_backend_handler)
+        kwargs["transport"] = httpx2.MockTransport(_mock_backend_handler)
         return real_async_client(*args, **kwargs)
 
-    monkeypatch.setattr(upstream.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(upstream.httpx2, "AsyncClient", fake_async_client)
 
     await _drive_interactive_reauth(provider)
 
@@ -203,21 +208,21 @@ async def test_drive_interactive_reauth_does_not_replay_the_probe(storage, monke
     async def redirect_handler(authorization_url: str) -> None:
         captured["url"] = authorization_url
 
-    async def callback_handler() -> tuple[str, str | None]:
+    async def callback_handler() -> AuthorizationCodeResult:
         state = parse_qs(urlparse(captured["url"]).query)["state"][0]
-        return "auth-code-789", state
+        return AuthorizationCodeResult(code="auth-code-789", state=state)
 
     provider = make_provider(storage, redirect_handler, callback_handler)
 
     mcp_path_calls: list[str] = []
     handler = make_mock_backend_handler(mcp_path_calls)
-    real_async_client = httpx.AsyncClient
+    real_async_client = httpx2.AsyncClient
 
     def fake_async_client(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(handler)
+        kwargs["transport"] = httpx2.MockTransport(handler)
         return real_async_client(*args, **kwargs)
 
-    monkeypatch.setattr(upstream.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(upstream.httpx2, "AsyncClient", fake_async_client)
 
     await _drive_interactive_reauth(provider)
 
@@ -232,20 +237,20 @@ async def test_drive_interactive_reauth_releases_lock_on_failure(storage, monkey
     hand-rolled driver that doesn't close the generator on the way out wedges
     every later connect attempt and every proactive token refresh."""
 
-    def boom(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("network down", request=request)
+    def boom(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("network down", request=request)
 
     provider = make_provider(storage, redirect_handler=None, callback_handler=None)
 
-    real_async_client = httpx.AsyncClient
+    real_async_client = httpx2.AsyncClient
 
     def fake_async_client(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(boom)
+        kwargs["transport"] = httpx2.MockTransport(boom)
         return real_async_client(*args, **kwargs)
 
-    monkeypatch.setattr(upstream.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(upstream.httpx2, "AsyncClient", fake_async_client)
 
-    with pytest.raises(httpx.ConnectError):
+    with pytest.raises(httpx2.ConnectError):
         await _drive_interactive_reauth(provider)
 
     assert not provider.context.lock.locked()
@@ -264,14 +269,14 @@ async def test_drive_interactive_reauth_releases_lock_on_cancellation(storage, m
 
     provider = make_provider(storage, redirect_handler=None, callback_handler=None)
 
-    real_async_client = httpx.AsyncClient
+    real_async_client = httpx2.AsyncClient
 
     def fake_async_client(*args, **kwargs):
         client = real_async_client(*args, **kwargs)
         monkeypatch.setattr(client, "send", slow_get)
         return client
 
-    monkeypatch.setattr(upstream.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(upstream.httpx2, "AsyncClient", fake_async_client)
 
     task = asyncio.ensure_future(_drive_interactive_reauth(provider))
     await started.wait()
@@ -296,17 +301,17 @@ async def test_drive_interactive_reauth_follows_redirects(storage, monkeypatch):
     async def redirect_handler(authorization_url: str) -> None:
         captured["url"] = authorization_url
 
-    async def callback_handler() -> tuple[str, str | None]:
+    async def callback_handler() -> AuthorizationCodeResult:
         state = parse_qs(urlparse(captured["url"]).query)["state"][0]
-        return "auth-code-redirected", state
+        return AuthorizationCodeResult(code="auth-code-redirected", state=state)
 
     provider = make_provider(storage, redirect_handler, callback_handler)
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path.startswith("/.well-known/"):
-            return httpx.Response(404)
+            return httpx2.Response(404)
         if request.url.path == "/register":
-            return httpx.Response(307, headers={"location": "/register-final"})
+            return httpx2.Response(307, headers={"location": "/register-final"})
         if request.url.path == "/register-final":
             info = OAuthClientInformationFull(
                 client_id="dcr-client-id",
@@ -315,9 +320,9 @@ async def test_drive_interactive_reauth_follows_redirects(storage, monkeypatch):
                 response_types=["code"],
                 token_endpoint_auth_method="none",
             )
-            return httpx.Response(201, json=info.model_dump(mode="json"))
+            return httpx2.Response(201, json=info.model_dump(mode="json"))
         if request.url.path == "/token":
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "access_token": "at-after-redirect",
@@ -326,16 +331,16 @@ async def test_drive_interactive_reauth_follows_redirects(storage, monkeypatch):
                 },
             )
         if request.url.path == "/mcp/":
-            return httpx.Response(200)
+            return httpx2.Response(200)
         raise AssertionError(f"unexpected request in test: {request.method} {request.url}")
 
-    real_async_client = httpx.AsyncClient
+    real_async_client = httpx2.AsyncClient
 
     def fake_async_client(*args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(handler)
+        kwargs["transport"] = httpx2.MockTransport(handler)
         return real_async_client(*args, **kwargs)
 
-    monkeypatch.setattr(upstream.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(upstream.httpx2, "AsyncClient", fake_async_client)
 
     await _drive_interactive_reauth(provider)
 

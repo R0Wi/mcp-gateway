@@ -180,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             # loggers with propagate=False. With no log_config, those
             # loggers keep logging's default propagate=True and pick up the
             # root handler/format installed by logging.basicConfig() above
-            # -- the same one every mcp_gateway/httpx/mcp.* log line uses --
+            # -- the same one every mcp_gateway/httpx2/mcp.* log line uses --
             # so access logs are formatted consistently with the rest.
             log_config=None,
         )

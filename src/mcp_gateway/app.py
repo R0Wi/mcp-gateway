@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # and its own message format (plain or Rich-colored), independent of the
 # logging.basicConfig() setup in mcp_gateway/__init__.py. Strip that handler
 # and let the logger propagate instead, so fastmcp's own log lines share the
-# same format as everything else (mcp_gateway.*, httpx, mcp.server.*, ...).
+# same format as everything else (mcp_gateway.*, httpx2, mcp.server.*, ...).
 # Safe to do unconditionally here: build_gateway (imported above) imports
 # fastmcp, which has by this point already run its own configure_logging().
 _fastmcp_logger = logging.getLogger("fastmcp")
@@ -38,6 +38,16 @@ _fastmcp_logger.propagate = True
 # records, and unused DCR/CIMD client registrations (see storage.py) are all
 # reclaimed on this interval, not just at startup.
 PURGE_INTERVAL_SECONDS = 15 * 60
+
+# Handshake-era (initialize + Mcp-Session-Id) MCP sessions are reaped after
+# this much inactivity; a later request on a reaped session gets 404, the
+# spec's signal for the client to re-initialize. Pinned here rather than left
+# to the SDK default: on the pre-FastMCP-4 stack sessions never expired, and
+# Claude kept reusing days-old sessions until one was answered with a 400
+# instead -- which it does not recover from, so the connector showed an empty
+# tool list until "Refresh tool list" was clicked. Modern (2026-07-28)
+# clients are sessionless and unaffected.
+MCP_SESSION_IDLE_TIMEOUT_SECONDS = 30 * 60
 
 # Anonymous, expensive endpoints: bounded per source IP. Login is also
 # offloaded to a thread (see web.py) so a flood can't stall the whole
@@ -79,7 +89,7 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
     mcp = build_gateway(config, provider, manager, clients)
     # The MCP endpoint lives at <public_url>/mcp; auth + well-known routes sit
     # at the root of the same app per RFC 8414/9728.
-    mcp_app = mcp.http_app(path="/mcp")
+    mcp_app = mcp.http_app(path="/mcp", session_idle_timeout=MCP_SESSION_IDLE_TIMEOUT_SECONDS)
 
     async def _purge_loop() -> None:
         while True:
