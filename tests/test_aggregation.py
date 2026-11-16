@@ -148,3 +148,50 @@ async def test_gateway_status_tool(stack):
         payload = result.structured_content or {}
         names = {entry["name"] for entry in payload.get("result", [])}
         assert names == {"echo", "docs", "dead"}
+
+
+def make_instructed_backend(name: str, instructions: str | None):
+    backend = FastMCP(name=f"{name}-backend", instructions=instructions)
+
+    @backend.tool
+    def ping_tool() -> str:
+        """A tool."""
+        return "ok"
+
+    return backend.http_app(path="/mcp")
+
+
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_backend_instructions_are_forwarded(run_server, mode):
+    """A backend's server instructions reach the client, in both protocol eras,
+    next to the gateway's own and labelled with the backend's namespace."""
+    wiki = run_server(make_instructed_backend("wiki", "Always cite the wiki page title."))
+    silent = run_server(make_instructed_backend("silent", None))
+    port = free_port()
+    config = gateway_config(
+        port,
+        backends={
+            "wiki": {"url": f"{wiki.base_url}/mcp", "auth": {"type": "none"}},
+            "silent": {"url": f"{silent.base_url}/mcp", "auth": {"type": "none"}},
+            "dead": {"url": "http://127.0.0.1:1/mcp", "auth": {"type": "none"}},
+        },
+    )
+    base = run_server(create_app(config), port).base_url
+    async with httpx.AsyncClient() as http:
+        client_id = await register_client(http, base)
+        token = (await obtain_tokens(http, base, client_id))["access_token"]
+
+    client = Client(
+        StreamableHttpTransport(f"{base}/mcp", headers={"Authorization": f"Bearer {token}"}),
+        mode=mode,
+    )
+    async with client:
+        instructions = client.instructions
+    assert instructions is not None
+    assert "Aggregating gateway" in instructions
+    assert "## Backend `wiki`" in instructions
+    assert "`wiki_`" in instructions
+    assert "Always cite the wiki page title." in instructions
+    # Backends with no instructions or that are unreachable add nothing.
+    assert "silent" not in instructions
+    assert "dead" not in instructions
