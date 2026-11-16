@@ -37,6 +37,9 @@ services:
       # needed if config.yaml has an upstream using GitHub OAuth
       # GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:?set GITHUB_OAUTH_CLIENT_ID}
       # GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:?set GITHUB_OAUTH_CLIENT_SECRET}
+      # needed if config.yaml logs users in through an OIDC provider (auth.oidc)
+      # OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?set OIDC_CLIENT_ID}
+      # OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?set OIDC_CLIENT_SECRET}
       # log verbosity: debug, info, warning, error, critical (default: info)
       MCP_GATEWAY_LOG_LEVEL: ${MCP_GATEWAY_LOG_LEVEL:-info}
     volumes:

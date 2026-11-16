@@ -9,7 +9,9 @@ HTTP) in front of any number of backend MCP servers. It has two independent OAut
 
 - **Client-facing** (`oauth_server.py`): the gateway *is* a spec-compliant OAuth 2.1
   authorization server for MCP clients — DCR (RFC 7591), CIMD, PKCE S256, RFC 8414/9728
-  metadata.
+  metadata. Who may approve those requests is decided by the browser login, which is
+  either the config-file users (`users.py`) or an external OIDC provider (`oidc.py`) —
+  a third, separate OAuth leg where the gateway is a client of an IdP.
 - **Backend-facing** (`upstream.py`): the gateway *is* an OAuth client against upstream
   MCP servers, using its own credentials.
 
@@ -86,6 +88,13 @@ Request flow, root to leaf:
   issuance/rotation policy. `authorize` parks the request as a transaction and redirects
   to `/ui/authorize?txn=…`; the Svelte UI drives login/consent through `web.py`'s JSON
   API and finally calls `complete_authorization`.
+- `oidc.py` is the optional external-IdP login (`auth.oidc`): discovery, PKCE
+  authorization code, and ID-token verification against the provider's JWKS. It stores
+  nothing — the in-flight PKCE verifier/nonce ride in a signed cookie
+  (`PendingLoginCodec`), and the outcome is just the normal `SessionManager` session,
+  so consent and everything downstream is unchanged. Routes live in `web.py`
+  (`build_oidc_router`) and 404 when no provider is configured. Deliberately not shared
+  with `upstream.py`: different direction, different credentials.
 - `upstream.py` uses the official SDK `OAuthClientProvider` with `DbTokenStorage`.
   OAuth backends are connected interactively **once** via `/oauth/connect/<backend>` in a
   browser; MCP traffic never triggers an interactive flow on its own. `ConnectFlow` state

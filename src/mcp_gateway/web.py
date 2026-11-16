@@ -1,6 +1,7 @@
 """FastAPI routes for the interactive parts of the gateway.
 
 - ``/auth/api/*``   – JSON API consumed by the Svelte login/consent UI
+- ``/auth/oidc/*``  – optional external identity provider login
 - ``/oauth/*``      – upstream backend connect flow + hosted CIMD document
 - ``/ui/*``         – the built Svelte single-page app
 - ``/healthz``      – liveness probe
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import quote
@@ -19,12 +21,18 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
+from mcp_gateway.oidc import FLOW_TTL_SECONDS, OIDC_FLOW_COOKIE, OIDCError
 from mcp_gateway.state import get_state
 from mcp_gateway.users import SESSION_COOKIE, verify_user
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static" / "ui"
+
+# Identity-provider login routes (see build_oidc_router). The callback path
+# is also what app.py registers as the gateway's redirect URI at the provider.
+OIDC_LOGIN_PATH = "/auth/oidc/login"
+OIDC_CALLBACK_PATH = "/auth/oidc/callback"
 
 
 class LoginRequest(BaseModel):
@@ -61,12 +69,50 @@ def _error_message(exc: Exception) -> str:
     return str(exc) or type(exc).__name__
 
 
+def _set_session_cookie(request: Request, response: Response, username: str) -> None:
+    config = get_state(request).config
+    response.set_cookie(
+        SESSION_COOKIE,
+        get_state(request).sessions.create(username),
+        max_age=config.auth.login_session_expiry_seconds,
+        httponly=True,
+        secure=config.server.public_url.startswith("https://"),
+        samesite="lax",
+        path="/",
+    )
+
+
+def _safe_next(next_url: str | None) -> str:
+    """Restrict post-login redirects to paths on this gateway.
+
+    ``next`` comes straight off the query string, so anything absolute (or
+    protocol-relative, which browsers resolve as absolute) would turn the
+    login endpoint into an open redirector -- a phishing primitive that is
+    especially unpleasant next to a consent screen.
+    """
+    if not next_url or not next_url.startswith("/") or next_url.startswith("//"):
+        return "/ui/backends"
+    return next_url
+
+
 def build_auth_router() -> APIRouter:
     router = APIRouter(prefix="/auth/api")
 
     @router.get("/me")
     async def me(request: Request):
         return {"username": _session_user(request)}
+
+    @router.get("/login-methods")
+    async def login_methods(request: Request):
+        """Which sign-in options the UI should offer. Deliberately public:
+        it is read before anyone is logged in, and reveals only what the
+        login screen shows anyway."""
+        auth = get_state(request).config.auth
+        oidc = auth.active_oidc
+        return {
+            "password": auth.password_login_enabled,
+            "oidc": {"name": oidc.display_name, "start_url": OIDC_LOGIN_PATH} if oidc else None,
+        }
 
     @router.get("/txn/{txn_id}")
     async def get_txn(txn_id: str, request: Request):
@@ -80,6 +126,11 @@ def build_auth_router() -> APIRouter:
     async def login(body: LoginRequest, request: Request, response: Response):
         state = get_state(request)
         config = state.config
+        if not config.auth.password_login_enabled:
+            # auth.users is empty: this deployment logs in through the IdP only.
+            raise HTTPException(
+                status_code=400, detail="Password login is disabled on this gateway"
+            )
         if not state.login_limiter.allow(_client_ip(request)):
             logger.warning("Login rate limit exceeded for %s", _client_ip(request))
             raise HTTPException(status_code=429, detail="Too many login attempts, try again later")
@@ -96,15 +147,7 @@ def build_auth_router() -> APIRouter:
             logger.warning("Failed login attempt for username %r", body.username)
             raise HTTPException(status_code=401, detail="Invalid username or password")
         logger.info("User %r logged in", body.username)
-        response.set_cookie(
-            SESSION_COOKIE,
-            get_state(request).sessions.create(body.username),
-            max_age=config.auth.login_session_expiry_seconds,
-            httponly=True,
-            secure=config.server.public_url.startswith("https://"),
-            samesite="lax",
-            path="/",
-        )
+        _set_session_cookie(request, response, body.username)
         return {"username": body.username}
 
     @router.post("/logout")
@@ -161,6 +204,122 @@ def build_auth_router() -> APIRouter:
                 yield json.dumps(event) + "\n"
 
         return StreamingResponse(events(), media_type="application/x-ndjson")
+
+    return router
+
+
+def _oidc_failure(next_url: str, message: str) -> RedirectResponse:
+    """Send the browser back where it came from with the error to display.
+
+    The login screen (rendered on both /ui/backends and /ui/authorize) picks
+    ``oidc_error`` off the query string, so a failed SSO attempt lands the
+    user back on the page they started from with a reason, rather than on a
+    bare JSON error page they can't act on.
+    """
+    separator = "&" if "?" in next_url else "?"
+    return RedirectResponse(f"{next_url}{separator}oidc_error={quote(message)}", status_code=303)
+
+
+def build_oidc_router() -> APIRouter:
+    """Login through an external identity provider (``auth.oidc``).
+
+    Both routes 404 when no provider is configured, so a gateway without
+    ``auth.oidc`` exposes no extra surface at all.
+    """
+    router = APIRouter(prefix="/auth/oidc")
+
+    def _client(request: Request):
+        client = get_state(request).oidc_client
+        if client is None:
+            raise HTTPException(status_code=404, detail="No identity provider configured")
+        return client
+
+    @router.get("/login")
+    async def login(request: Request, next: str | None = None):
+        client = _client(request)
+        state = get_state(request)
+        next_url = _safe_next(next)
+        # Every hit starts a discovery/JWKS fetch against the provider, so
+        # this shares the login limiter with the password form.
+        if not state.login_limiter.allow(_client_ip(request)):
+            logger.warning("OIDC login rate limit exceeded for %s", _client_ip(request))
+            return _oidc_failure(next_url, "Too many login attempts, try again later")
+        try:
+            authorize_url, pending = await client.start_login(next_url)
+        except OIDCError as exc:
+            logger.error("Could not start OIDC login: %s", exc)
+            return _oidc_failure(next_url, _error_message(exc))
+        except Exception as exc:
+            logger.exception("Could not start OIDC login")
+            return _oidc_failure(next_url, f"Could not reach the identity provider: {exc!s}")
+
+        response = RedirectResponse(authorize_url, status_code=303)
+        config = state.config
+        response.set_cookie(
+            OIDC_FLOW_COOKIE,
+            state.oidc_flows.dumps(pending),
+            max_age=FLOW_TTL_SECONDS,
+            httponly=True,
+            secure=config.server.public_url.startswith("https://"),
+            # "lax", not "strict": the provider sends the browser back with a
+            # top-level GET navigation from its own origin, and a strict
+            # cookie would not be attached to it.
+            samesite="lax",
+            path="/auth/oidc",
+        )
+        return response
+
+    @router.get("/callback")
+    async def callback(request: Request):
+        client = _client(request)
+        state = get_state(request)
+        pending = state.oidc_flows.loads(request.cookies.get(OIDC_FLOW_COOKIE))
+        if pending is None:
+            return _oidc_failure(
+                "/ui/backends", "Your sign-in attempt expired. Please try again."
+            )
+
+        def _done(response: RedirectResponse) -> RedirectResponse:
+            # Single-use either way: a consumed (or failed) flow cookie must
+            # not be replayable against a second callback.
+            response.delete_cookie(OIDC_FLOW_COOKIE, path="/auth/oidc")
+            return response
+
+        params = request.query_params
+        if params.get("error"):
+            description = params.get("error_description") or params["error"]
+            logger.warning("Identity provider returned an error: %s", description)
+            return _done(_oidc_failure(pending.next_url, description))
+        code, returned_state = params.get("code"), params.get("state")
+        if not code:
+            return _done(_oidc_failure(pending.next_url, "The identity provider sent no code"))
+        # CSRF: the state must be the one this browser was issued.
+        if not returned_state or not secrets.compare_digest(returned_state, pending.state):
+            logger.warning("OIDC callback state mismatch from %s", _client_ip(request))
+            return _done(
+                _oidc_failure(pending.next_url, "Sign-in state did not match. Please try again.")
+            )
+
+        try:
+            identity = await client.complete_login(code, pending)
+        except OIDCError as exc:
+            logger.warning("OIDC login failed: %s", exc)
+            return _done(_oidc_failure(pending.next_url, _error_message(exc)))
+        except Exception as exc:
+            logger.exception("OIDC login failed")
+            return _done(
+                _oidc_failure(pending.next_url, f"Sign-in failed: {_error_message(exc)}")
+            )
+
+        logger.info(
+            "User %r logged in via identity provider %s (sub=%s)",
+            identity.username,
+            client.config.issuer,
+            identity.subject,
+        )
+        response = RedirectResponse(pending.next_url, status_code=303)
+        _set_session_cookie(request, response, identity.username)
+        return _done(response)
 
     return router
 

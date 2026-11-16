@@ -109,7 +109,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check":
         config = load_config(args.config)
-        print(f"OK: {len(config.auth.users)} user(s), {len(config.backends)} backend(s)")
+        oidc = config.auth.active_oidc
+        login = f"{len(config.auth.users)} local user(s)"
+        if oidc:
+            login += f", OIDC login via {oidc.issuer}"
+        print(f"OK: {login}, {len(config.backends)} backend(s)")
         return 0
 
     if args.command == "migrate":
@@ -149,8 +153,11 @@ def main(argv: list[str] | None = None) -> int:
         logger.debug("Loading config from %s", args.config)
         config = load_config(args.config)
         logger.info(
-            "Config loaded: %d user(s), %d backend(s) (%s)",
+            "Config loaded: %d local user(s)%s, %d backend(s) (%s)",
             len(config.auth.users),
+            f", OIDC login via {config.auth.active_oidc.issuer}"
+            if config.auth.active_oidc
+            else "",
             len(config.backends),
             ", ".join(sorted(config.backends)) or "none",
         )

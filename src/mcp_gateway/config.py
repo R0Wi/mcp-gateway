@@ -59,6 +59,58 @@ class UserConfig(BaseModel):
         return self
 
 
+class OIDCConfig(BaseModel):
+    """An external OpenID Connect provider used to log in to the gateway's UI.
+
+    Optional alternative (or addition) to `auth.users`: instead of the local
+    login form, the browser is redirected to the IdP and the identity it
+    returns becomes the gateway session's user. This is the *client-facing*
+    login only -- it has nothing to do with `backends.*.auth.type: oauth`,
+    which is how the gateway authenticates itself against upstream servers.
+    """
+
+    enabled: bool = True
+    # Issuer URL. Endpoints are discovered from
+    # <issuer>/.well-known/openid-configuration unless overridden below.
+    issuer: str
+    client_id: str
+    # Omit for a public client: the gateway then authenticates with PKCE
+    # alone (S256), which is what an IdP-registered "public"/native client
+    # expects.
+    client_secret: str | None = None
+    scopes: list[str] = Field(default_factory=lambda: ["openid", "profile", "email"])
+    # Claim used as the gateway username (shown in the UI, recorded as the
+    # OAuth subject). Falls back to "sub" when the claim is absent.
+    username_claim: str = "preferred_username"
+    # Claim carrying group/role membership, for `allowed_groups`.
+    groups_claim: str = "groups"
+    # Optional allow-lists. When both are set a user needs to satisfy only
+    # one of them; when neither is set, anyone the IdP authenticates may log
+    # in (appropriate when the IdP itself restricts who sees this client).
+    allowed_users: list[str] | None = None
+    allowed_groups: list[str] | None = None
+    # Label for the UI's sign-in button ("Continue with ...").
+    display_name: str = "SSO"
+    # Endpoint overrides for providers without (or with an unreachable)
+    # discovery document. When all three are set, discovery is skipped.
+    authorization_endpoint: str | None = None
+    token_endpoint: str | None = None
+    jwks_uri: str | None = None
+
+    @field_validator("issuer")
+    @classmethod
+    def _normalize_issuer(cls, v: str) -> str:
+        return v.rstrip("/")
+
+    @model_validator(mode="after")
+    def _check(self) -> OIDCConfig:
+        if "openid" not in self.scopes:
+            # Without it the provider need not return an ID token at all,
+            # and the ID token is the only thing the gateway trusts.
+            self.scopes = ["openid", *self.scopes]
+        return self
+
+
 class ServerConfig(BaseModel):
     # Public HTTPS URL clients use to reach the gateway (behind the reverse proxy).
     public_url: str
@@ -82,7 +134,11 @@ class ServerConfig(BaseModel):
 
 
 class AuthConfig(BaseModel):
-    users: list[UserConfig]
+    # Local username/password users. May be empty when `oidc` is configured,
+    # in which case the login form is replaced by the SSO button entirely.
+    users: list[UserConfig] = Field(default_factory=list)
+    # Optional external OpenID Connect provider for the browser login.
+    oidc: OIDCConfig | None = None
     # Fernet key (or arbitrary passphrase, which is stretched via scrypt) used to
     # encrypt secrets at rest in the SQLite database. Normally supplied via
     # ${MCP_GATEWAY_ENCRYPTION_KEY}; set MCP_GATEWAY_ENCRYPTION_KEY_FILE instead
@@ -113,6 +169,23 @@ class AuthConfig(BaseModel):
     # Scopes advertised to MCP clients. The gateway is a single-identity AS, so
     # scopes are informational; "mcp" is the default catch-all.
     scopes_supported: list[str] = Field(default_factory=lambda: ["mcp"])
+
+    @model_validator(mode="after")
+    def _check_login_methods(self) -> AuthConfig:
+        if not self.users and not (self.oidc and self.oidc.enabled):
+            raise ValueError(
+                "No way to log in: configure auth.users, or auth.oidc with enabled: true"
+            )
+        return self
+
+    @property
+    def password_login_enabled(self) -> bool:
+        return bool(self.users)
+
+    @property
+    def active_oidc(self) -> OIDCConfig | None:
+        """The OIDC provider to use, or None when unconfigured/disabled."""
+        return self.oidc if (self.oidc and self.oidc.enabled) else None
 
 
 class BackendAuthConfig(BaseModel):
