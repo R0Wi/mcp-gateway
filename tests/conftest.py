@@ -120,8 +120,16 @@ async def obtain_tokens(
     password: str = "pw",
     approve: bool = True,
     scope: str | None = "mcp",
+    client_secret: str | None = None,
+    auth_style: str = "post",
 ) -> dict:
-    """Drive authorize -> login -> consent -> token; returns the token response JSON."""
+    """Drive authorize -> login -> consent -> token; returns the token response JSON.
+
+    ``auth_style`` controls how ``client_secret`` (if any) is presented at the
+    token endpoint: ``"post"`` (form body), ``"basic"`` (HTTP Basic, client_id
+    also in the body) or ``"basic_only"`` (HTTP Basic, client_id omitted from
+    the body as RFC 6749 §2.3.1 allows).
+    """
     verifier, challenge = pkce_pair()
     params = {
         "client_id": client_id,
@@ -152,16 +160,22 @@ async def obtain_tokens(
         return {"error": query["error"][0], "state": query.get("state", [None])[0]}
     assert query["state"][0] == "test-state"
 
-    r = await http.post(
-        f"{base}/token",
-        data={
-            "grant_type": "authorization_code",
-            "code": query["code"][0],
-            "redirect_uri": redirect_uri,
-            "client_id": client_id,
-            "code_verifier": verifier,
-            "resource": f"{base}/mcp",
-        },
-    )
+    data = {
+        "grant_type": "authorization_code",
+        "code": query["code"][0],
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "code_verifier": verifier,
+        "resource": f"{base}/mcp",
+    }
+    auth = None
+    if client_secret is not None:
+        if auth_style == "post":
+            data["client_secret"] = client_secret
+        else:
+            auth = httpx.BasicAuth(client_id, client_secret)
+            if auth_style == "basic_only":
+                del data["client_id"]
+    r = await http.post(f"{base}/token", data=data, auth=auth)
     assert r.status_code == 200, r.text
     return r.json()
