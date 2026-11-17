@@ -187,6 +187,27 @@ falls back to Dynamic Client Registration. If the upstream AS supports neither (
 GitHub's), set `client_id` (and `client_secret`, if the app is confidential) to use a
 pre-registered OAuth client instead — CIMD/DCR are skipped entirely.
 
+### Backend instructions
+
+A backend's own server `instructions` (the guidance it publishes for the model) are
+appended to the gateway's, each under a `## Backend <name>` section. The gateway reads
+them in the background (at startup, then every 5 minutes; a failed read is retried
+after 30 seconds and keeps the last text that was read), so a slow or unreachable
+backend never delays a client's `initialize`. An `oauth` backend is read only while it
+is connected.
+
+That text is written by the backend and reaches every connected model. The gateway
+caps it at 8000 characters per backend, strips control characters and demotes its
+headings so one backend can't imitate another's section, but it does not judge what
+the text says. To keep a backend's instructions out entirely:
+
+```yaml
+backends:
+  some-backend:
+    url: https://example.com/mcp
+    forward_instructions: false          # default: true
+```
+
 ### Encryption key
 
 `auth.encryption_key` protects everything the gateway stores at rest: registered
@@ -331,6 +352,9 @@ misdirected backup, a shared volume snapshot, a support bundle.
   loopback redirects (CIMD localhost-impersonation guidance from the spec).
 - Tokens issued to MCP clients are never forwarded to backends, and backend
   credentials never reach MCP clients.
+- Backend-supplied server instructions are size-capped and structurally sanitised
+  before they are passed to MCP clients, and can be switched off per backend — see
+  [Backend instructions](#backend-instructions).
 - Sessions are `HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS.
 - Login and Dynamic Client Registration (`/register`) are rate-limited per source IP;
   password checks run off the event loop so a flood of attempts can't stall the server.

@@ -82,6 +82,9 @@ backends:
     url: https://learn.microsoft.com/api/mcp
     auth:
       type: none
+    # The backend's own server instructions are appended to the gateway's
+    # (size-capped, in a section of their own). Set to false to drop them.
+    # forward_instructions: false
 
   # Static bearer token (e.g. a PAT for a backend that accepts tokens directly).
   # github-pat:

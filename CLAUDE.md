@@ -81,6 +81,11 @@ Request flow, root to leaf:
 - `gateway.py` mounts each backend as a live FastMCP proxy under its namespace, so
   backend `github`'s `create_issue` becomes `github_create_issue`. A down or
   not-yet-connected backend only removes its own tools.
+- `backend_instructions.py` appends each backend's server `instructions` to the
+  gateway's `initialize` / `server/discover` response. One background task per backend
+  (started from the FastMCP server's lifespan) keeps a cache fresh; the handshake only
+  serves the cache and must never do backend I/O. Reads are deliberately not cancelled
+  on a timer — one can contain an OAuth refresh-token grant.
 - `oauth_server.py` builds on the MCP SDK's AS handlers and FastMCP's CIMD manager; the
   gateway adds SQLite persistence, the login/consent transaction flow, and token
   issuance/rotation policy. `authorize` parks the request as a transaction and redirects
