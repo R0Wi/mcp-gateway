@@ -269,6 +269,51 @@ async def test_non_exception_failures_from_a_read_do_not_stop_refreshing(make_mi
     assert flaky.attempts >= 2
 
 
+async def test_cancelled_shutdown_still_resets_startup_state(make_middleware):
+    """Closing refreshing() awaits the refresh tasks; if the closer is itself
+    cancelled during that wait, the startup state must already be reset."""
+    started = asyncio.Event()
+    unwinding = asyncio.Event()
+
+    class SlowToCancelClient:
+        """Takes a while to unwind, like fastmcp's shielded connect cleanup."""
+
+        instructions = None
+
+        def new(self) -> SlowToCancelClient:
+            return self
+
+        async def __aenter__(self) -> Self:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                unwinding.set()
+                await asyncio.shield(asyncio.sleep(0.5))
+                raise
+
+        async def __aexit__(self, *exc_info) -> None:
+            return None
+
+    middleware, _ = make_middleware({"slow": {"url": "http://127.0.0.1:1/mcp"}})
+    middleware._clients["slow"] = SlowToCancelClient()
+    stop = asyncio.Event()
+
+    async def run() -> None:
+        async with middleware.refreshing():
+            await stop.wait()
+
+    runner = asyncio.create_task(run())
+    await started.wait()
+    assert middleware._warm is not None and not middleware._warm.is_set()
+    stop.set()
+    await unwinding.wait()  # runner is now waiting for the refresh task to unwind
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    assert middleware._warm is None
+
+
 async def test_stopping_cancels_reads_in_flight(run_server, make_middleware, hung_backend):
     middleware, _ = make_middleware({"hung": public(hung_backend.base_url)}, startup_grace=0.1)
     async with middleware.refreshing():

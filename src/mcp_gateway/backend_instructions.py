@@ -165,33 +165,48 @@ class BackendInstructionsMiddleware(Middleware):
         self._max_chars = max_chars
         # name -> sanitized, non-empty instruction text
         self._cache: dict[str, str] = {}
-        # Backends whose first read hasn't finished yet, and the event set
-        # once that set drains; both only exist while refreshing() is active.
-        self._awaiting_first_read: set[str] = set()
+        # Set once every backend's first read has finished (or failed); only
+        # exists while refreshing() is active.
         self._warm: asyncio.Event | None = None
         self._warm_deadline = 0.0
 
     @contextlib.asynccontextmanager
     async def refreshing(self) -> AsyncIterator[None]:
         """Keep the cache fresh for as long as the context is open."""
-        self._awaiting_first_read = set(self._clients)
-        self._warm = asyncio.Event()
+        # Startup bookkeeping belongs to this run alone: the tasks get their
+        # own references, so a task from an earlier run that is still
+        # unwinding can never mark a later run as warm.
+        awaiting_first_read = set(self._clients)
+        warm = asyncio.Event()
+        self._warm = warm
         self._warm_deadline = time.monotonic() + self._startup_grace
         tasks = [
-            asyncio.create_task(self._refresh_loop(name, client), name=f"instructions-{name}")
+            asyncio.create_task(
+                self._refresh_loop(name, client, awaiting_first_read, warm),
+                name=f"instructions-{name}",
+            )
             for name, client in self._clients.items()
         ]
         if not tasks:
-            self._warm.set()
+            warm.set()
         try:
             yield
         finally:
+            # Reset before awaiting anything: the await below raises
+            # CancelledError if whoever is closing this context is cancelled
+            # meanwhile (shutdown is not guaranteed to run undisturbed), and
+            # any line after it would then be skipped.
+            if self._warm is warm:
+                self._warm = None
             for task in tasks:
                 task.cancel()
+            # Child failures are returned, not raised; this only raises if
+            # this task is cancelled, and the children are already cancelled.
             await asyncio.gather(*tasks, return_exceptions=True)
-            self._warm = None
 
-    async def _refresh_loop(self, name: str, client: Client) -> None:
+    async def _refresh_loop(
+        self, name: str, client: Client, awaiting_first_read: set[str], warm: asyncio.Event
+    ) -> None:
         while True:
             try:
                 ok = await self._refresh(name, client)
@@ -207,9 +222,9 @@ class BackendInstructionsMiddleware(Middleware):
                     exc,
                 )
                 ok = False
-            self._awaiting_first_read.discard(name)
-            if not self._awaiting_first_read and self._warm is not None:
-                self._warm.set()
+            awaiting_first_read.discard(name)
+            if not awaiting_first_read:
+                warm.set()
             await asyncio.sleep(self._ttl if ok else self._failure_ttl)
 
     async def _refresh(self, name: str, client: Client) -> bool:
