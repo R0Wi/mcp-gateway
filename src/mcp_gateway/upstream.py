@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -368,6 +369,19 @@ class ConnectFlow:
         self.task: asyncio.Task[None] | None = None
 
 
+# The ConnectFlow the current task is driving, if any. Set only inside
+# start_connect's background task (and inherited by tasks it spawns). The
+# OAuth provider is shared per backend between that task and all ordinary MCP
+# traffic, so "a flow exists for this backend" alone doesn't say who is asking
+# for an authorization URL: without this, any other request that happened to
+# hit a 401 while an admin's flow was pending would be handed the flow -- the
+# admin would approve a URL whose PKCE verifier belongs to that request, and
+# their own attempt would then fail.
+_driving_flow: contextvars.ContextVar[ConnectFlow | None] = contextvars.ContextVar(
+    "mcp_gateway_driving_flow", default=None
+)
+
+
 class BackendManager:
     """Builds authenticated FastMCP clients for every configured backend and
     orchestrates interactive OAuth connect flows."""
@@ -482,9 +496,10 @@ class BackendManager:
     def _make_redirect_handler(self, backend: str):
         async def redirect_handler(authorization_url: str) -> None:
             flow = self._flows_by_backend.get(backend)
-            if flow is None or flow.authorize_url.done():
+            if flow is None or flow.authorize_url.done() or _driving_flow.get() is not flow:
                 # OAuth flow triggered outside an interactive connect session
-                # (e.g. plain MCP traffic hitting an unconnected backend).
+                # (e.g. plain MCP traffic hitting an unconnected backend), or
+                # by something other than the task driving that session.
                 raise NotConnectedError(
                     f"Backend '{backend}' requires authorization. "
                     f"Open {self.config.server.public_url}/ui/backends to connect it."
@@ -542,6 +557,9 @@ class BackendManager:
         provider = self._build_oauth_provider(name, backend)
 
         async def drive() -> None:
+            # Mark this task as the one entitled to the flow's authorize URL
+            # (see _driving_flow).
+            _driving_flow.set(flow)
             # Force a fresh authorization via _drive_interactive_reauth
             # instead of just pinging and hoping the server 401s an
             # unauthenticated/expired token: JsonTokenOAuthClientProvider now
@@ -638,6 +656,24 @@ class BackendManager:
             provider._initialized = False
 
     # ------------------------------------------------------------- status
+
+    def is_connected(self, name: str) -> bool:
+        """Whether the gateway holds what it needs to talk to backend `name`.
+
+        Always true for static auth; an OAuth backend counts as connected once
+        tokens from a completed connect flow are stored.
+        """
+        backend = self.config.backends.get(name)
+        if backend is None:
+            return False
+        if backend.auth.type != "oauth":
+            return True
+        return self.storage.get_upstream(name, "tokens") is not None
+
+    def connect_in_progress(self, name: str) -> bool:
+        """Whether an interactive connect flow for `name` is currently running."""
+        flow = self._flows_by_backend.get(name)
+        return flow is not None and flow.task is not None and not flow.task.done()
 
     def backend_status(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []

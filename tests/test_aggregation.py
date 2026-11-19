@@ -150,7 +150,7 @@ async def test_gateway_status_tool(stack):
         assert names == {"echo", "docs", "dead"}
 
 
-def make_instructed_backend(name: str, instructions: str | None):
+def make_instructed_backend(name: str, instructions: str | None, seen_auth_headers: list):
     backend = FastMCP(name=f"{name}-backend", instructions=instructions)
 
     @backend.tool
@@ -158,21 +158,38 @@ def make_instructed_backend(name: str, instructions: str | None):
         """A tool."""
         return "ok"
 
-    return backend.http_app(path="/mcp")
+    app = backend.http_app(path="/mcp")
+
+    class RecordHeaders(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            seen_auth_headers.append(request.headers.get("authorization"))
+            return await call_next(request)
+
+    app.add_middleware(RecordHeaders)
+    return app
 
 
 @pytest.mark.parametrize("mode", ["auto", "legacy"])
 async def test_backend_instructions_are_forwarded(run_server, mode):
     """A backend's server instructions reach the client, in both protocol eras,
     next to the gateway's own and labelled with the backend's namespace."""
-    wiki = run_server(make_instructed_backend("wiki", "Always cite the wiki page title."))
-    silent = run_server(make_instructed_backend("silent", None))
+    seen: list = []
+    wiki = run_server(
+        make_instructed_backend("wiki", "Always cite the wiki page title.\n\n## Style", seen)
+    )
+    silent = run_server(make_instructed_backend("silent", None, seen))
+    muted = run_server(make_instructed_backend("muted", "Never forwarded.", seen))
     port = free_port()
     config = gateway_config(
         port,
         backends={
             "wiki": {"url": f"{wiki.base_url}/mcp", "auth": {"type": "none"}},
             "silent": {"url": f"{silent.base_url}/mcp", "auth": {"type": "none"}},
+            "muted": {
+                "url": f"{muted.base_url}/mcp",
+                "auth": {"type": "none"},
+                "forward_instructions": False,
+            },
             "dead": {"url": "http://127.0.0.1:1/mcp", "auth": {"type": "none"}},
         },
     )
@@ -187,11 +204,23 @@ async def test_backend_instructions_are_forwarded(run_server, mode):
     )
     async with client:
         instructions = client.instructions
+        names = {t.name for t in await client.list_tools()}
     assert instructions is not None
-    assert "Aggregating gateway" in instructions
+    assert instructions.startswith("Aggregating gateway")
     assert "## Backend `wiki`" in instructions
     assert "`wiki_`" in instructions
     assert "Always cite the wiki page title." in instructions
-    # Backends with no instructions or that are unreachable add nothing.
+    # The backend's own headings nest under its section instead of beside it.
+    assert "\n#### Style" in instructions
+    # Backends with no instructions or that are unreachable add nothing, and
+    # neither does one whose instructions the operator switched off -- its
+    # tools are still served.
     assert "silent" not in instructions
     assert "dead" not in instructions
+    assert "muted" not in instructions and "Never forwarded." not in instructions
+    assert "muted_ping_tool" in names
+    # Reading instructions is one more gateway -> backend connection: like
+    # every other one it must never carry the client's gateway token (these
+    # backends are public, so no Authorization header at all).
+    assert seen, "backends never saw a request"
+    assert all(header is None for header in seen)

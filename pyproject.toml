@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Self-hosted MCP aggregator gateway with a spec-compliant client-facing OAuth 2.1 authorization server (DCR + CIMD + PKCE)"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "AGPL-3.0-only" }
 dependencies = [
     "fastmcp>=4.0.5,<5",
     "fastapi>=0.141.1",

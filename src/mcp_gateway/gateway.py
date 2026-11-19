@@ -10,19 +10,19 @@ listing instead of breaking the whole gateway.
 
 from __future__ import annotations
 
-import asyncio
 import base64
+import contextlib
 import dataclasses
 import functools
 import logging
-import time
+from collections.abc import AsyncIterator
 
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports.base import TransportOptions
 from fastmcp.server import create_proxy
-from fastmcp.server.middleware import Middleware
-from mcp.types import DiscoverResult, Icon, ToolAnnotations
+from mcp.types import Icon, ToolAnnotations
 
+from mcp_gateway.backend_instructions import BackendInstructionsMiddleware
 from mcp_gateway.config import GatewayConfig
 from mcp_gateway.oauth_server import GatewayOAuthProvider
 from mcp_gateway.upstream import BackendManager, NoForwardStreamableHttpTransport
@@ -80,104 +80,28 @@ def _require_no_header_forwarding(name: str, client: Client) -> None:
         )
 
 
-class BackendInstructionsMiddleware(Middleware):
-    """Append every backend's own server ``instructions`` to the gateway's.
-
-    fastmcp forwards a proxied backend's instructions only when the proxy is
-    the root server (``ProxyMetadataMiddleware``). Mounted under the gateway,
-    that middleware never runs, and the gateway sets its own instructions
-    anyway, so without this the guidance a backend ships for its model would
-    be silently dropped. Each backend's text goes in its own section, headed by
-    the namespace its tools were mounted under, since the text refers to the
-    backend's un-prefixed tool names.
-
-    Works for both protocol eras: ``initialize`` (handshake) and
-    ``server/discover`` (sessionless ``2026-07-28``). Discover can arrive on
-    every client connection, so results are cached for ``ttl`` seconds, and
-    backends that couldn't be read (down, OAuth not connected yet, slow) are
-    retried after only ``failure_ttl``. A backend never delays or fails the
-    gateway's own handshake by more than ``timeout`` seconds.
-    """
-
-    def __init__(
-        self,
-        clients: dict[str, Client],
-        *,
-        ttl: float = 300.0,
-        failure_ttl: float = 30.0,
-        timeout: float = 5.0,
-    ) -> None:
-        self._clients = clients
-        self._ttl = ttl
-        self._failure_ttl = failure_ttl
-        self._timeout = timeout
-        # name -> (instructions or None, monotonic expiry)
-        self._cache: dict[str, tuple[str | None, float]] = {}
-        self._lock = asyncio.Lock()
-
-    async def _read(self, name: str, client: Client) -> tuple[str | None, bool]:
-        """Return ``(instructions, ok)`` read from a fresh session to the backend."""
-
-        async def read() -> str | None:
-            # A separate client instance: never touch the proxy's own sessions.
-            fresh = client.new()
-            async with fresh:
-                return fresh.instructions
-
-        try:
-            return await asyncio.wait_for(read(), timeout=self._timeout), True
-        except Exception as exc:  # noqa: BLE001 - one backend must not break initialize
-            logger.debug(
-                "Backend %s: could not read server instructions: %s: %s",
-                name,
-                type(exc).__name__,
-                exc,
-            )
-            return None, False
-
-    async def _backend_instructions(self) -> dict[str, str]:
-        async with self._lock:
-            now = time.monotonic()
-            stale = [n for n in self._clients if self._cache.get(n, (None, 0.0))[1] <= now]
-            if stale:
-                results = await asyncio.gather(*(self._read(n, self._clients[n]) for n in stale))
-                now = time.monotonic()
-                for name, (text, ok) in zip(stale, results, strict=True):
-                    self._cache[name] = (text, now + (self._ttl if ok else self._failure_ttl))
-            return {
-                name: text.strip()
-                for name in self._clients
-                if (text := self._cache[name][0]) and text.strip()
-            }
-
-    async def _merged(self, base: str | None) -> str | None:
-        sections = [
-            f"## Backend `{name}` (its tools are exposed with the prefix `{name}_`)\n\n{text}"
-            for name, text in (await self._backend_instructions()).items()
-        ]
-        if not sections:
-            return base
-        return "\n\n".join([base, *sections] if base else sections)
-
-    async def on_initialize(self, context, call_next):
-        result = await call_next(context)
-        if result is None:
-            return None
-        return result.model_copy(update={"instructions": await self._merged(result.instructions)})
-
-    async def on_discover(self, context, call_next):
-        result = await call_next(context)
-        if not isinstance(result, DiscoverResult):
-            return result
-        return result.model_copy(update={"instructions": await self._merged(result.instructions)})
-
-
 def build_gateway(
     config: GatewayConfig,
     provider: GatewayOAuthProvider,
     manager: BackendManager,
     clients: dict[str, Client],
 ) -> FastMCP:
+    # Backends' own server instructions are appended to the gateway's (see
+    # backend_instructions.py). `clients` holds exactly the enabled backends.
+    instructions = BackendInstructionsMiddleware(
+        {
+            name: client
+            for name, client in clients.items()
+            if config.backends[name].forward_instructions
+        },
+        manager,
+    )
+
+    @contextlib.asynccontextmanager
+    async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
+        async with instructions.refreshing():
+            yield {}
+
     mcp: FastMCP = FastMCP(
         name="MCP Gateway",
         instructions=(
@@ -187,6 +111,7 @@ def build_gateway(
         ),
         icons=_server_icons(),
         auth=provider,
+        lifespan=lifespan,
         # Don't leak backend URLs, HTTP error bodies or internal exception
         # types to MCP clients; diagnose failures from the server logs
         # instead (run with --log-level debug for detail).
@@ -219,7 +144,6 @@ def build_gateway(
         logger.debug("gateway_status tool invoked")
         return manager.backend_status()
 
-    mounted: dict[str, Client] = {}
     for name, backend in config.backends.items():
         if not backend.enabled:
             logger.info("Backend %s is disabled; skipping", name)
@@ -227,10 +151,8 @@ def build_gateway(
         _require_no_header_forwarding(name, clients[name])
         proxy = create_proxy(clients[name], name=f"proxy-{name}", mask_error_details=True)
         mcp.mount(proxy, namespace=name)
-        mounted[name] = clients[name]
         logger.info("Mounted backend %s (%s, auth=%s)", name, backend.url, backend.auth.type)
 
-    if mounted:
-        mcp.add_middleware(BackendInstructionsMiddleware(mounted))
+    mcp.add_middleware(instructions)
 
     return mcp

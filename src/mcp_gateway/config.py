@@ -153,6 +153,11 @@ class BackendConfig(BaseModel):
     auth: BackendAuthConfig = Field(default_factory=BackendAuthConfig)
     # Extra static headers sent with every request regardless of auth type.
     headers: dict[str, str] = Field(default_factory=dict)
+    # Append the backend's own server `instructions` to the gateway's, in a
+    # section of their own. That text is written by the backend and reaches
+    # every connected model, so turn it off for a backend whose guidance you
+    # don't want to pass on.
+    forward_instructions: bool = True
 
 
 class StorageConfig(BaseModel):
