@@ -24,6 +24,7 @@ from fastmcp.server.middleware import Middleware
 from mcp.types import DiscoverResult, Icon, ToolAnnotations
 
 from mcp_gateway.config import GatewayConfig
+from mcp_gateway.diagnostics import strip_query
 from mcp_gateway.oauth_server import GatewayOAuthProvider
 from mcp_gateway.upstream import BackendManager, NoForwardStreamableHttpTransport
 from mcp_gateway.web import STATIC_DIR
@@ -228,7 +229,9 @@ def build_gateway(
         proxy = create_proxy(clients[name], name=f"proxy-{name}", mask_error_details=True)
         mcp.mount(proxy, namespace=name)
         mounted[name] = clients[name]
-        logger.info("Mounted backend %s (%s, auth=%s)", name, backend.url, backend.auth.type)
+        logger.info(
+            "Mounted backend %s (%s, auth=%s)", name, strip_query(backend.url), backend.auth.type
+        )
 
     if mounted:
         mcp.add_middleware(BackendInstructionsMiddleware(mounted))
