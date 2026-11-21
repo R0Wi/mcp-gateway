@@ -64,6 +64,10 @@ def stack(run_server):
                 "url": f"{echo_server.base_url}/mcp",
                 "auth": {"type": "bearer", "token": BACKEND_TOKEN},
             },
+            "wrong-token": {
+                "url": f"{echo_server.base_url}/mcp?api_key=query-secret",
+                "auth": {"type": "bearer", "token": "not-the-backend-token"},
+            },
             "docs": {"url": f"{public_server.base_url}/mcp", "auth": {"type": "none"}},
             "dead": {"url": "http://127.0.0.1:1/mcp", "auth": {"type": "none"}},
             "up": {"url": f"{upstream.base_url}/mcp", "auth": {"type": "oauth"}},
@@ -152,3 +156,39 @@ async def test_unconnected_oauth_backend_fails_before_list_tools(stack):
         # (not auth or list_tools) is where the missing connection shows up.
         assert not any(e["check"] == "list_tools" for e in events)
         assert events[-1]["status"] == "error"
+
+
+async def test_rejected_credentials_report_http_details(stack):
+    async with httpx.AsyncClient(timeout=30) as http:
+        await _login(http, stack.base_url)
+        r = await http.post(f"{stack.base_url}/auth/api/backends/wrong-token/test-connection")
+        assert r.status_code == 200
+        failed = _events(r)[-1]
+        assert (failed["check"], failed["status"]) == ("ping", "error")
+        # The SDK alone only says "Server returned an error response"; the
+        # one-line summary now names the HTTP status too.
+        assert "HTTP 401" in failed["detail"]
+
+        details = failed["details"]
+        assert details["auth_type"] == "bearer"
+        assert details["hint"] == "The backend rejected the configured bearer token."
+        assert details["exceptions"]
+        rejected = [e for e in details["http"] if e["status"] == 401]
+        assert rejected and rejected[0]["method"] == "POST"
+        assert rejected[0]["body"] == '{"error":"unauthorized"}'
+        assert rejected[0]["headers"]["content-type"] == "application/json"
+
+        # Nothing the gateway sends is echoed back: not the configured token,
+        # not a secret carried in the backend URL's query string.
+        assert "not-the-backend-token" not in r.text
+        assert "query-secret" not in r.text
+        assert details["backend_url"].endswith("/mcp")
+
+
+async def test_unreachable_backend_details_hint_at_reachability(stack):
+    async with httpx.AsyncClient(timeout=30) as http:
+        await _login(http, stack.base_url)
+        r = await http.post(f"{stack.base_url}/auth/api/backends/dead/test-connection")
+        details = _events(r)[-1]["details"]
+        assert details["http"] == []
+        assert "could not reach the backend" in details["hint"]

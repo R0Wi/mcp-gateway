@@ -46,6 +46,7 @@ from mcp.shared.auth import (
 )
 from pydantic import AnyUrl
 
+from mcp_gateway import diagnostics
 from mcp_gateway.config import BackendConfig, GatewayConfig
 from mcp_gateway.storage import Storage
 
@@ -399,7 +400,12 @@ class BackendManager:
             len(headers),
         )
         transport = NoForwardStreamableHttpTransport(
-            backend.url, headers=headers or None, auth=auth
+            backend.url,
+            headers=headers or None,
+            auth=auth,
+            # The SDK default client, plus a hook that records HTTP exchanges
+            # while a connection test runs (see diagnostics.trace_http).
+            httpx_client_factory=diagnostics.traced_http_client_factory,
         )
         return Client(transport)
 
@@ -697,7 +703,9 @@ class BackendManager:
         Each check yields a ``running`` event followed by an ``ok``/``error``
         event, so a caller can stream live progress to a UI. Stops at the
         first failing check -- there is no point listing tools on a backend
-        that couldn't even be pinged.
+        that couldn't even be pinged. An ``error`` event carries a one-line
+        ``detail`` plus a ``details`` object (HTTP exchanges, exception chain,
+        hint) for the UI's "See details" view; see ``diagnostics.failure``.
         """
         backend = self.config.backends[name]
         # Set as soon as any check has reported a definitive result, so a
@@ -706,61 +714,64 @@ class BackendManager:
         # is never mistaken for a fresh ping failure below.
         reported = False
 
+        def error(check: str, exc: BaseException) -> dict[str, Any]:
+            summary, details = diagnostics.failure(
+                exc, backend_url=backend.url, auth_type=backend.auth.type, exchanges=exchanges
+            )
+            return {"check": check, "status": "error", "detail": summary, "details": details}
+
+        # A fresh client so the test opens (and traces) its own session
+        # rather than possibly reusing one that is already connected.
+        client = client.new()
         yield {"check": "ping", "status": "running"}
-        try:
-            async with client:
-                try:
-                    detail = await probe_backend(client)
-                except Exception as exc:  # noqa: BLE001 - report to the waiting UI
-                    reported = True
-                    yield {
-                        "check": "ping",
-                        "status": "error",
-                        "detail": f"{type(exc).__name__}: {exc}",
-                    }
-                    return
-                yield {"check": "ping", "status": "ok", "detail": detail}
+        with diagnostics.trace_http() as exchanges:
+            try:
+                async with client:
+                    try:
+                        detail = await probe_backend(client)
+                    except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+                        reported = True
+                        yield error("ping", exc)
+                        return
+                    yield {"check": "ping", "status": "ok", "detail": detail}
 
-                yield {"check": "auth", "status": "running"}
-                try:
-                    detail = await self._check_auth(name, backend)
-                except Exception as exc:  # noqa: BLE001 - report to the waiting UI
-                    reported = True
-                    yield {
-                        "check": "auth",
-                        "status": "error",
-                        "detail": f"{type(exc).__name__}: {exc}",
-                    }
-                    return
-                yield {"check": "auth", "status": "ok", "detail": detail}
+                    yield {"check": "auth", "status": "running"}
+                    try:
+                        detail = await self._check_auth(name, backend)
+                    except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+                        reported = True
+                        yield error("auth", exc)
+                        return
+                    yield {"check": "auth", "status": "ok", "detail": detail}
 
-                yield {"check": "list_tools", "status": "running"}
-                try:
-                    tools = await client.list_tools()
-                except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+                    yield {"check": "list_tools", "status": "running"}
+                    try:
+                        tools = await client.list_tools()
+                    except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+                        reported = True
+                        yield error("list_tools", exc)
+                        return
                     reported = True
                     yield {
                         "check": "list_tools",
-                        "status": "error",
-                        "detail": f"{type(exc).__name__}: {exc}",
+                        "status": "ok",
+                        "detail": f"Listed {len(tools)} tool(s)",
                     }
+            except Exception as exc:  # noqa: BLE001 - report to the waiting UI
+                if reported:
+                    logger.debug(
+                        "Backend %s: ignoring cleanup error after connection test finished: %s",
+                        name,
+                        exc,
+                    )
                     return
-                reported = True
-                yield {
-                    "check": "list_tools",
-                    "status": "ok",
-                    "detail": f"Listed {len(tools)} tool(s)",
-                }
-        except Exception as exc:  # noqa: BLE001 - report to the waiting UI
-            if reported:
-                logger.debug(
-                    "Backend %s: ignoring cleanup error after connection test finished: %s",
+                # Opening the client session itself failed (transport couldn't
+                # even connect) -- no check body above ran, so attribute it to
+                # ping, the check this replaces.
+                event = error("ping", exc)
+                logger.info(
+                    "Backend %s: connection test failed to open session: %s",
                     name,
-                    exc,
+                    event["detail"],
                 )
-                return
-            # Opening the client session itself failed (transport couldn't
-            # even connect) -- no check body above ran, so attribute it to
-            # ping, the check this replaces.
-            logger.info("Backend %s: connection test failed to open session: %s", name, exc)
-            yield {"check": "ping", "status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+                yield event

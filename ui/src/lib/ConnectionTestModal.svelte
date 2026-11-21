@@ -1,5 +1,6 @@
 <script>
   import { api } from './api.js';
+  import ConnectionTestDetails from './ConnectionTestDetails.svelte';
 
   let { name, onclose } = $props();
 
@@ -12,6 +13,16 @@
   let results = $state(Object.fromEntries(CHECKS.map((c) => [c.key, { status: 'pending' }])));
   let error = $state('');
   let done = $state(false);
+  let showDetails = $state(false);
+
+  // The check that failed, if any. The test stops at the first failure, so
+  // there is at most one; its full report opens in a separate modal to keep
+  // the step overview to one line per check.
+  let failed = $derived(
+    CHECKS.map((c) => ({ ...c, ...results[c.key] })).find(
+      (c) => c.status === 'error' && c.details,
+    ),
+  );
 
   const controller = new AbortController();
 
@@ -25,7 +36,11 @@
   async function run() {
     try {
       for await (const event of api.testConnection(name, controller.signal)) {
-        results[event.check] = { status: event.status, detail: event.detail };
+        results[event.check] = {
+          status: event.status,
+          detail: event.detail,
+          details: event.details,
+        };
       }
     } catch (e) {
       if (e.name !== 'AbortError') {
@@ -76,6 +91,9 @@
     {/if}
 
     <div class="actions">
+      {#if failed}
+        <button class="secondary" onclick={() => (showDetails = true)}>See details</button>
+      {/if}
       {#if done}
         <button class="primary" onclick={onclose}>Close</button>
       {:else}
@@ -84,6 +102,15 @@
     </div>
   </div>
 </div>
+
+{#if showDetails && failed}
+  <ConnectionTestDetails
+    label={failed.label}
+    summary={failed.detail}
+    details={failed.details}
+    onclose={() => (showDetails = false)}
+  />
+{/if}
 
 <style>
   .backdrop {
@@ -161,6 +188,7 @@
   .actions {
     display: flex;
     justify-content: flex-end;
+    gap: 0.6rem;
     margin-top: 1.25rem;
   }
 
