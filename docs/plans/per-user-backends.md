@@ -1,166 +1,213 @@
-# Plan: per-user backends, connected during MCP client sign-in
+# Plan: per-user backends, managed in the UI, connected during MCP client sign-in
 
 Status: proposed — not implemented.
 
 ## Motivation
 
-Today an admin connects each OAuth backend once via `/ui/backends`, and the gateway keeps it
-alive with refresh tokens. Three problems with that:
+Today the operator defines backends in `config.yaml`, an admin connects each OAuth backend
+once via `/ui/backends`, and the gateway keeps it alive with refresh tokens. Problems:
 
-1. **Backend credentials are global.** `DbTokenStorage` keys upstream tokens by backend name
-   only, so every gateway user and every MCP client shares one upstream identity (e.g. one
-   GitHub account). The gateway is single-user today, but should support several users, each
-   with their own, isolated backend accounts.
-2. **Connecting is a separate, manual step.** The MCP client has to sign in to the gateway in
-   a browser anyway; that is the natural moment to connect the backends too.
-3. **A dead backend is silent.** When a backend's refresh token stops working, the backend's
-   tools quietly disappear. Nothing records the state (`backend_status()` still says
-   `connected: true` because the token row exists), and nothing sends the user back to a
-   browser — MCP clients hold 30-day refresh tokens and rarely re-run `/authorize`.
+1. **Backends and their credentials are global.** `DbTokenStorage` keys upstream tokens by
+   backend name only, so every gateway user and every MCP client shares one upstream identity
+   (e.g. one GitHub account). The gateway is single-user today, but should support several
+   users, each with their own, fully separated backends.
+2. **Adding a backend means editing a file and restarting.** Users should define and manage
+   their backends themselves, in the UI, without operator involvement or a restart.
+3. **Connecting is a separate, manual step.** The MCP client has to sign in to the gateway in a
+   browser anyway; that is the natural moment to connect the backends too.
+4. **A dead backend is silent.** When a backend's refresh token stops working, its tools quietly
+   disappear. Nothing records the state (`backend_status()` still says `connected: true`
+   because the token row exists), and nothing sends the user back to a browser — MCP clients
+   hold 30-day refresh tokens and rarely re-run `/authorize`.
 
 ## Decisions
 
 | Topic | Decision |
 |---|---|
-| Identity | Per-user backend credentials, isolated between gateway users. |
-| Sign-in step | During MCP client sign-in, after login and before Approve, go through only the backends that are missing or need re-auth, one at a time; each can be skipped. |
-| Stale backend | Immediately invalidate the user's gateway tokens (401 on `/mcp`), so the client re-runs sign-in and the sign-in step. |
+| Backend definitions | Live in the database, managed entirely in the UI. Each backend is **private to the user who created it**: nobody else sees it, its credentials, or its tools. |
+| Auth types | All of today's types are configured in the UI per backend: `none`, bearer token, custom headers, OAuth (automatic CIMD/DCR, or a pre-registered `client_id`/`client_secret`, scopes, prefer-DCR). |
+| `config.yaml` `backends:` | Removed, **no import**. Users re-add their backends in the UI once. Existing upstream tokens are dropped. |
+| Changes at runtime | Adding, editing, disabling or deleting a backend takes effect without a restart. |
+| Sign-in step | During MCP client sign-in, after login and before Approve, go through only the user's backends that are missing credentials or need re-auth, one at a time; each can be skipped. |
+| Stale backend | Immediately invalidate that user's gateway tokens (401 on `/mcp`), so the client re-runs sign-in and the sign-in step. |
 | Spec-native alternative | Investigate MCP URL-mode elicitation first (Phase 0). |
-| Existing global tokens | Migration assigns them to the user if exactly one is configured; otherwise drops them and logs that users must reconnect. |
-| Static-credential backends | Support per-user static credentials (user enters their own API key / token). Operator-configured shared credentials remain available. |
+| Gateway users | Stay in `config.yaml` for now; managing users in the UI is out of scope. |
 | Background refresh | Out of scope. Stale backends are detected on use. |
 
 ## Findings that shape the design
 
 - `fastmcp` 4.2.x `ProxyProvider` / `FastMCPProxy` take a `client_factory` (sync or async)
   invoked **per request**. Inside it, `fastmcp.server.dependencies.get_access_token()` yields
-  the caller's token, whose `subject` is the gateway username. So per-user routing needs no
-  fork of FastMCP.
+  the caller's token, whose `subject` is the gateway username.
 - `ProxyProvider` caches component lists (tools, resources, prompts) **across all sessions**,
-  300 s by default. With per-user credentials that would show one user's backend tool list to
-  another. Per-user backends must use `cache_ttl=0` (or a per-subject cache).
+  300 s by default. Per-user backends must never share that cache between users.
+- Today each backend is mounted once at startup (`mcp.mount(proxy, namespace=name)`). With
+  per-user, runtime-defined backends, the set of backends — and so the tool list — depends on
+  who is calling. That needs one gateway-level provider that resolves the caller's backends per
+  request (Phase 0 spike).
 - The MCP SDK ships `UrlElicitationRequiredError` (code `-32042`). FastMCP does not reference
   it anywhere, so it is unknown whether it survives `mask_error_details=True` and the proxy
   path, in either protocol era.
 - `access_tokens` and `refresh_tokens` already have a `subject` column, so revoking all of a
   user's gateway tokens is a single `DELETE`/`UPDATE` each.
 - The SDK's `OAuthClientProvider` holds an internal lock for a whole interactive flow; one
-  provider per `(backend, subject)` also stops one user's connect flow from blocking another's.
+  provider per backend row also stops one user's connect flow from blocking another's.
 
 ## Phases
 
-### Phase 0 — URL-elicitation spike (time-boxed)
+### Phase 0 — spikes (time-boxed)
 
-Find out whether a tool call can answer "open this URL to (re)connect backend X" instead of
-signing the whole client out.
+**a) Per-user dynamic provider.** Prove that one custom FastMCP provider mounted at the root can,
+per request:
+- resolve the caller's subject, load their enabled backends, and list each backend's tools under
+  its namespace prefix (`<name>_<tool>`);
+- route `tools/call` (and resources/prompts) to the right backend client;
+- pick up a backend added or removed at runtime on the next request, in both protocol eras, and
+  send `notifications/tools/list_changed` to that user's sessions where the era supports it;
+- keep the component cache per backend row, never shared between users.
 
-- Raise `UrlElicitationRequiredError` from a proxied tool call and check it reaches the client
-  as a JSON-RPC error with code `-32042` and intact `data`, despite `mask_error_details=True`,
-  in both the handshake era and `2026-07-28`.
-- Check what Claude Code and claude.ai do with it (open the URL? retry?).
-- Outcome decides Phase 4: if it works end to end, a stale backend first answers with the
-  elicitation, and the 401 becomes the fallback; if not, the 401 is the only mechanism.
+If the provider API can't do this cleanly, the fallback is building one `ProxyProvider` per
+backend row and filtering visibility per session — less attractive because tool names of other
+users' backends would exist on the server.
 
-### Phase 1 — per-user backend credentials (base for everything else)
+**b) URL elicitation.** Raise `UrlElicitationRequiredError` from a proxied tool call and check it
+reaches the client as a JSON-RPC error with code `-32042` and intact `data`, despite
+`mask_error_details=True`, in both eras; check what Claude Code and claude.ai do with it. The
+outcome decides Phase 6: if it works end to end, a stale backend first answers with the
+elicitation and the 401 becomes the fallback; otherwise the 401 is the only mechanism.
 
-- **Migration `0003`** (hand-written, existence-guarded like `0002`): add `subject` to
-  `upstream_data` and include it in the uniqueness key. User-specific rows (`tokens`, per-user
-  static credentials) carry a subject; gateway-level rows (`client_info` from DCR/CIMD,
-  `auth_metadata`) keep `subject = ''` — they are the gateway's own registration with the
-  upstream AS and stay shared.
-  - Existing `tokens` rows: if exactly one user is configured, assign to them; otherwise
-    delete and log a warning that users must reconnect. The migration has no config access,
-    so this step runs in startup code (or `mcp-gateway migrate`) after Alembic, not in the
-    revision itself.
-- **Storage / `DbTokenStorage`**: take `(backend, subject)`; `get/save/delete_upstream` grow a
-  subject parameter.
-- **`BackendManager`**: cache OAuth providers per `(backend, subject)`; key `ConnectFlow` by
-  `(backend, subject)`; `/oauth/callback` additionally checks the session user equals the
-  flow's subject. `disconnect`, `backend_status`, `test_connection` become per-user.
-- **`gateway.py`**: mount per-user backends with a per-request async factory that resolves the
-  subject and returns that user's client, with `cache_ttl=0`. Requests without a subject
-  fail closed. Backends with operator-configured shared credentials (`none` / `bearer` /
-  `headers`) keep today's single shared client.
-- **No-token-passthrough check**: `_require_no_header_forwarding` today inspects one client per
-  backend at startup. Extend it to cover clients the factory produces (build them only through
-  one helper that always uses `NoForwardStreamableHttpTransport`, and assert on its output).
-  Never weaken or remove the check.
-- **`BackendInstructionsMiddleware`**: cache per subject for per-user backends.
-- **Per-user views**: `/ui/backends`, `gateway_status`, test-connection and disconnect show the
-  logged-in user's own state.
-- **Cleanup**: on startup, drop per-user rows whose subject is no longer a configured user.
+### Phase 1 — backend registry in the database
 
-### Phase 2 — stale-state tracking
+- **Migration `0003`** (hand-written, existence-guarded like `0002`):
+  - new `backends` table: `id`, `owner` (subject), `name` (namespace; unique per owner),
+    `url`, `enabled`, `auth_type`, non-secret settings (scopes, prefer-DCR, header names),
+    encrypted secrets blob (bearer token, header values, OAuth `client_secret`),
+    `created_at`, `updated_at`;
+  - `upstream_data` rekeyed from backend name to `backend_id` (`ON DELETE CASCADE`);
+    existing rows are deleted, since `config.yaml` backends are not imported.
+- **Storage**: CRUD for backends, always scoped by owner — every query takes the subject, so a
+  lookup of another user's backend returns "not found", never "forbidden".
+- **Validation**: `name` matches `^[a-z0-9][a-z0-9-]{0,31}$`, `gateway` is reserved, URL must
+  be `https://` (plain `http://` only when the gateway itself runs on `http://`, i.e. local
+  dev); a configurable per-user backend limit (default 50).
+- **Config**: drop `backends:` from the config schema and `config.example.yaml`. A config file
+  that still has the section logs a warning naming the ignored backends and points to
+  `/ui/backends`; it does not fail startup.
+- `${ENV_VAR}` expansion no longer applies to backend secrets — they are entered in the UI and
+  stored encrypted with the existing envelope encryption (KEK/DEK).
+- `mcp-gateway check` no longer validates backends.
 
-- Persist per `(backend, subject)`: `connected | needs_reauth (since, reason) | not_connected`.
-- Only a **real auth failure** counts: `invalid_grant`, or 401 on the refresh request,
-  recorded through the existing `_handle_refresh_response` override, and the 401 → interactive
-  path that ends in `redirect_handler` with no flow. A 5xx, a timeout or a network error must
-  **not** mark a backend stale (it would sign the user out for an upstream outage). Verify how
-  the SDK routes transient refresh failures before relying on `redirect_handler` as a signal.
-- For per-user static credentials: a 401/403 from the backend marks it `needs_reauth`.
-- Cleared on a successful connect / credential save.
-- Shown in `/ui/backends` and `gateway_status`.
+### Phase 2 — per-user, runtime routing
 
-### Phase 3 — connect backends during client sign-in
+- Replace the startup `mount()` loop in `gateway.py` with the Phase 0a provider.
+- **`BackendManager`** caches one FastMCP `Client` and, for OAuth, one `OAuthClientProvider`
+  per backend row; an edit or delete invalidates (and closes) the cached entries.
+- **OAuth**: `DbTokenStorage(backend_id)` holds tokens, `client_info` and `auth_metadata` per
+  backend row — with private backends there is nothing left to share between users. The
+  gateway's CIMD document and `/oauth/callback` stay single, gateway-wide endpoints.
+- **`ConnectFlow`** keyed by backend id; `/oauth/callback` additionally checks the session user
+  owns the flow's backend.
+- **No-token-passthrough**: every backend client is built by one helper that always uses
+  `NoForwardStreamableHttpTransport` and asserts it at build time (replacing the startup-only
+  `_require_no_header_forwarding` loop, which has no backends to check any more). The
+  `TransportOptions.forward_incoming_headers` existence check stays at startup. Never weaken or
+  remove either check.
+- **`BackendInstructionsMiddleware`**: cache per backend row; merge only the caller's backends.
+- **`gateway_status`** reports the caller's backends only.
+- Requests without a subject fail closed (no backends).
 
-- `describe_txn` (or a new `/auth/api/txn/{id}/backends`) returns the logged-in user's
+### Phase 3 — backend management UI and API
+
+- **JSON API** under `/auth/api/backends` (session required, all owner-scoped): list, create,
+  update, delete, enable/disable, test connection, connect/disconnect (existing endpoints move
+  from backend name to backend id).
+  - Secrets are **write-only**: responses say whether a secret is set, never return it. An
+    update with an omitted secret keeps the stored one.
+  - Mutating endpoints require `Content-Type: application/json` (no simple-form CSRF), in
+    addition to the `SameSite=Lax` session cookie.
+  - Delete drops tokens and registration data; best-effort RFC 7009 revocation upstream when
+    the AS advertises a revocation endpoint.
+- **UI** (`Backends.svelte`): list with status (connected / needs re-auth / not connected /
+  disabled); add/edit form with name, URL, enabled, and an auth type selector:
+  - *None*
+  - *Bearer token* — token field
+  - *Custom headers* — name/value rows
+  - *OAuth* — automatic (CIMD or DCR, optional scopes, prefer DCR), or pre-registered client
+    (`client_id`, `client_secret`, scopes) with the callback URL shown for copying
+  - "Test connection" works on unsaved form values before saving.
+- **Outbound URL policy (SSRF)**: any user can now make the gateway send requests to an
+  arbitrary URL — the backend URL itself, plus OAuth discovery, registration and token URLs it
+  learns from metadata. By default, block loopback, link-local (incl. cloud metadata
+  `169.254.169.254`), private and unique-local ranges, checked on the **resolved IP at connect
+  time** (DNS rebinding), applied to all backend and upstream-OAuth HTTP clients. An operator
+  setting in `config.yaml` allows specific hosts/CIDRs (e.g. a Docker network) or turns the
+  check off for a single-user deployment.
+
+### Phase 4 — stale-state tracking
+
+- Persist per backend row: `connected | needs_reauth (since, reason) | not_connected`.
+- Only a **real auth failure** counts: for OAuth, `invalid_grant` or 401 on the refresh request
+  (via the existing `_handle_refresh_response` override) and the 401 → interactive path that
+  ends in `redirect_handler` with no flow; for bearer/headers, a 401/403 from the backend. A
+  5xx, a timeout or a network error must **not** mark a backend stale (it would sign the user
+  out for an upstream outage). Verify how the SDK routes transient refresh failures before
+  relying on `redirect_handler` as a signal.
+- Cleared on a successful connect or credential update.
+
+### Phase 5 — connect backends during client sign-in
+
+- `describe_txn` (or `/auth/api/txn/{id}/backends`) returns the logged-in user's enabled
   backends that are `not_connected` or `needs_reauth`.
 - `Authorize.svelte`, after login and before consent, goes through them one at a time:
-  - OAuth backend: `/oauth/connect/<b>` → upstream AS → `/oauth/callback` → back to
-    `/ui/authorize?txn=…`.
-  - Per-user static backend: an inline form for the key/token.
-  - Every step has **Skip**; Approve is reachable once each backend is connected or skipped.
+  - OAuth: `/oauth/connect/<id>` → upstream AS → `/oauth/callback` → back to
+    `/ui/authorize?txn=…`;
+  - bearer/headers: an inline form to enter or replace the credential;
+  - every step has **Skip**; Approve is reachable once each backend is connected or skipped;
+  - a link to add a new backend is out of scope for this page — the sign-in step only fixes
+    existing ones.
 - `ConnectFlow` stores `return_txn` **on the server**; the callback redirects there instead of
   `/ui/backends`. Never take the return target from a query parameter (open redirect).
 - Extend the transaction TTL (600 s today) on each step, so several upstream logins fit.
-- `/ui/backends` stays for connecting backends outside the sign-in flow.
 
-### Phase 4 — forced re-auth (immediate 401)
+### Phase 6 — forced re-auth (immediate 401)
 
-- When a `(backend, subject)` changes **from healthy to `needs_reauth`**, delete that user's
-  access tokens and revoke their refresh tokens. The next `/mcp` request gets 401, the
-  client's refresh gets `invalid_grant`, and the client runs a full `/authorize`, which shows
-  the stale backend in the Phase 3 sign-in step.
-- Revocation fires **only on that change from healthy to stale**. That is what prevents a
-  loop: a user who skips the backend gets fresh tokens that stay valid, and a backend that was
-  never connected never triggers revocation.
+- When a backend changes **from healthy to `needs_reauth`**, delete its owner's access tokens
+  and revoke their refresh tokens. The next `/mcp` request gets 401, the client's refresh gets
+  `invalid_grant`, and the client runs a full `/authorize`, which shows the stale backend in the
+  Phase 5 sign-in step.
+- Revocation fires **only on that change from healthy to stale**. That prevents a loop: a user
+  who skips the backend gets fresh tokens that stay valid, and a backend that was never
+  connected never triggers revocation.
 - The tool call that hits the failure is already inside an MCP response and can't become an
   HTTP 401; it returns a clear "backend X needs re-authorization" error — or the URL
-  elicitation, if Phase 0 says yes.
+  elicitation, if Phase 0b says yes.
 - Accepted cost: all of that user's clients are signed out, headless ones included, until the
   user goes through the browser again. Other users are unaffected.
 
-### Phase 5 — per-user static credentials
+### Phase 7 — tests and docs
 
-- Config: a backend opts in, e.g.
-  ```yaml
-  backends:
-    some-api:
-      url: https://api.example.com/mcp
-      auth:
-        type: user_bearer          # or user_headers
-        # user_headers: header names the user fills in, e.g. ["X-Api-Key"]
-  ```
-  Operator-configured `bearer` / `headers` keep working as shared credentials.
-- Users enter values in `/ui/backends` or in the sign-in step; stored encrypted in
-  `upstream_data` under their subject. Never logged.
-- Per-request factory builds the client with that user's headers.
-
-### Phase 6 — tests and docs
-
+- **Test fixtures**: `conftest.py` and existing tests define backends through `config.yaml`;
+  they move to creating backends through the storage layer or the new API. Expect broad churn
+  in the test suite — do it in the same PR as Phase 1/2 so the suite stays green.
 - E2E tests over real HTTP, using the existing "second gateway as OAuth upstream" fixture:
-  - two users: isolated tokens, isolated tool lists (proxy cache not shared)
+  - backend CRUD; secrets never returned by the API or written to logs
+  - two users: user A cannot list, read, edit, test, connect, or call user B's backends or
+    tools (404, not 403); component caches not shared
+  - add a backend at runtime → its tools appear without restart; delete → tools gone, tokens
+    and registration deleted
+  - each auth type end to end, including pre-registered OAuth client
+  - outbound URL policy blocks loopback/private/metadata targets, including via a redirect or
+    an OAuth metadata URL, and honours the operator allowlist
   - sign-in step connects a backend; Skip works; transaction TTL extension
-  - healthy → stale → 401 → re-auth → working again
-  - no loop after Skip
+  - healthy → stale → 401 → re-auth → working again; no loop after Skip
   - a transient upstream error (5xx / timeout) does **not** sign the user out
-  - migration: one user → tokens assigned; several users → dropped with warning
-  - per-user static credentials round-trip and are never logged
-  - `/oauth/callback` rejects a session user different from the flow's subject
-- README: multi-user model, sign-in step, forced re-auth behaviour, headless-client caveat.
-- CLAUDE.md invariants: no cross-user credential use; no shared proxy component cache for
-  per-user backends; the factory is the only way to build per-user backend clients.
+  - migration `0003`: old `upstream_data` rows removed, a `config.yaml` with `backends:` starts
+    with a warning
+- **README**: backends are managed in the UI; multi-user model; sign-in step; forced re-auth and
+  the headless-client caveat; outbound URL policy; endpoint table.
+- **CLAUDE.md**: replace "Adding a backend is config-only" with the UI model; new invariants —
+  every backend query is owner-scoped; no cross-user component cache; backend clients only
+  built by the one helper; outbound URL policy applies to every backend-facing HTTP client.
 
 ## Open risks
 
@@ -168,6 +215,8 @@ signing the whole client out.
   re-auth leaves them without any backend until a human signs in.
 - **Detection on use only**: without background refresh, a stale backend is noticed when the
   user next calls one of its tools.
-- **Single-instance**: connect flows and the per-subject client/provider caches are in memory,
+- **SSRF surface**: user-supplied URLs are the biggest new attack surface; the outbound policy
+  must cover OAuth metadata-derived URLs and redirects, not only the backend URL.
+- **Breaking upgrade**: existing `config.yaml` backends stop working until re-added in the UI.
+- **Single-instance**: connect flows and the per-backend client/provider caches are in memory,
   consistent with the gateway's single-process design.
-- **Memory**: one OAuth provider per `(backend, subject)` — fine for a handful of users.
